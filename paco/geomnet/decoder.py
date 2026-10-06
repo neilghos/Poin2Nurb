@@ -22,29 +22,65 @@ class DifferentiableNurbsEvaluator(nn.Module):
         basis = torch.stack([b0, b1, b2, b3], dim=-1)  # shape: (R, 4)
         self.register_buffer("basis", basis)
 
-    def forward(self, control_points, weights=None):
+        # Analytical first derivatives of cubic Bernstein basis with respect to t
+        db0 = -3.0 * ((1.0 - t) ** 2)
+        db1 = 3.0 * ((1.0 - t) ** 2) - 6.0 * t * (1.0 - t)
+        db2 = 6.0 * t * (1.0 - t) - 3.0 * (t ** 2)
+        db3 = 3.0 * (t ** 2)
+        d_basis = torch.stack([db0, db1, db2, db3], dim=-1)  # shape: (R, 4)
+        self.register_buffer("d_basis", d_basis)
+
+    def forward(self, control_points, weights=None, return_normals=True):
         """
         Args:
             control_points: Tensor of shape (B, K, 4, 4, 3)
             weights: Optional tensor of shape (B, K, 4, 4)
+            return_normals: If True, also computes exact analytical surface normals
         Returns:
-            surface_points: Tensor of shape (B, K * R * R, 3)
+            surface_points: (B, K * R * R, 3)
+            surface_normals (optional): (B, K * R * R, 3)
         """
         B, K, _, _, _ = control_points.shape
-        M = self.basis  # (R, 4)
+        M = self.basis      # (R, 4)
+        dM = self.d_basis   # (R, 4)
 
         if weights is None:
             # Standard integral B-spline patch
             S = torch.einsum("ru, bkuvc, sv -> bkrsc", M, control_points, M)
+            surface_points = S.reshape(B, K * self.num_samples * self.num_samples, 3)
+
+            if return_normals:
+                Tu = torch.einsum("ru, bkuvc, sv -> bkrsc", dM, control_points, M)
+                Tv = torch.einsum("ru, bkuvc, sv -> bkrsc", M, control_points, dM)
+                n_unnorm = torch.cross(Tu, Tv, dim=-1)
+                normals = F.normalize(n_unnorm, dim=-1, eps=1e-7)
+                surface_normals = normals.reshape(B, K * self.num_samples * self.num_samples, 3)
+                return surface_points, surface_normals
+            return surface_points
         else:
             # Rational NURBS patch: S = sum(w * P) / sum(w)
             P_w = control_points * weights.unsqueeze(-1)
             S_num = torch.einsum("ru, bkuvc, sv -> bkrsc", M, P_w, M)
             S_den = torch.einsum("ru, bkuv, sv -> bkrs", M, weights, M).unsqueeze(-1)
             S = S_num / (S_den + 1e-7)
+            surface_points = S.reshape(B, K * self.num_samples * self.num_samples, 3)
 
-        # Flatten patches into a single dense surface point cloud
-        return S.reshape(B, K * self.num_samples * self.num_samples, 3)
+            if return_normals:
+                # Analytical partial derivatives via quotient rule
+                d_Nu = torch.einsum("ru, bkuvc, sv -> bkrsc", dM, P_w, M)
+                d_Du = torch.einsum("ru, bkuv, sv -> bkrs", dM, weights, M).unsqueeze(-1)
+
+                d_Nv = torch.einsum("ru, bkuvc, sv -> bkrsc", M, P_w, dM)
+                d_Dv = torch.einsum("ru, bkuv, sv -> bkrs", M, weights, dM).unsqueeze(-1)
+
+                Tu = d_Nu * S_den - S_num * d_Du
+                Tv = d_Nv * S_den - S_num * d_Dv
+
+                n_unnorm = torch.cross(Tu, Tv, dim=-1)
+                normals = F.normalize(n_unnorm, dim=-1, eps=1e-7)
+                surface_normals = normals.reshape(B, K * self.num_samples * self.num_samples, 3)
+                return surface_points, surface_normals
+            return surface_points
 
 
 class NurbsDecoder(nn.Module):
@@ -76,15 +112,17 @@ class NurbsDecoder(nn.Module):
         # Rational weights: 4 x 4 = 16 values per patch (positive)
         self.weight_head = nn.Linear(256, 4 * 4)
 
-    def forward(self, shape_embedding):
+    def forward(self, shape_embedding, return_normals=True):
         """
         Args:
             shape_embedding: Tensor of shape (B, embed_dim)
+            return_normals: If True, evaluates analytical surface normals
         Returns:
             dict containing:
               - 'control_points': (B, K, 4, 4, 3)
               - 'weights': (B, K, 4, 4)
               - 'surface_points': (B, K * R * R, 3)
+              - 'surface_normals' (optional): (B, K * R * R, 3)
         """
         B = shape_embedding.shape[0]
 
@@ -102,13 +140,21 @@ class NurbsDecoder(nn.Module):
         w = F.softplus(self.weight_head(feat)).reshape(B, self.num_patches, 4, 4) + 0.1
 
         # Evaluate continuous parametric surfaces
-        surface_points = self.evaluator(cp, w)
-
-        return {
-            "control_points": cp,
-            "weights": w,
-            "surface_points": surface_points,
-        }
+        if return_normals:
+            surface_points, surface_normals = self.evaluator(cp, w, return_normals=True)
+            return {
+                "control_points": cp,
+                "weights": w,
+                "surface_points": surface_points,
+                "surface_normals": surface_normals,
+            }
+        else:
+            surface_points = self.evaluator(cp, w, return_normals=False)
+            return {
+                "control_points": cp,
+                "weights": w,
+                "surface_points": surface_points,
+            }
 
 
 def chamfer_distance(p1, p2, chunk_size=1024):
@@ -124,7 +170,7 @@ def chamfer_distance(p1, p2, chunk_size=1024):
     B, N, _ = p1.shape
     M = p2.shape[1]
 
-    if N * M <= 8_000_000:
+    if N * M <= 70_000_000:
         dists = torch.cdist(p1, p2)
         return dists.min(dim=2)[0].mean() + dists.min(dim=1)[0].mean()
 
@@ -143,5 +189,43 @@ def chamfer_distance(p1, p2, chunk_size=1024):
     min_d2 = torch.cat(min_d2_list, dim=1)
 
     return min_d1.mean() + min_d2.mean()
+
+
+def chamfer_and_normal_loss(p_pred, n_pred, p_gt, n_gt, lambda_normal=0.1):
+    """
+    Joint Chamfer Distance and Analytical Normal Alignment Loss.
+    Uses the exact nearest-neighbor correspondences computed from torch.cdist.
+    
+    Args:
+        p_pred: Predicted surface points (B, N, 3)
+        n_pred: Analytical unit surface normals (B, N, 3)
+        p_gt: Ground truth surface points (B, M, 3)
+        n_gt: Ground truth surface normals (B, M, 3)
+        lambda_normal: Weight for symmetric normal alignment loss
+    Returns:
+        total_loss, cd_loss, normal_loss, nc_metric
+    """
+    dists = torch.cdist(p_pred, p_gt)  # (B, N, M)
+    min_d1, idx1 = dists.min(dim=2)    # (B, N)
+    min_d2, idx2 = dists.min(dim=1)    # (B, M)
+
+    cd_loss = min_d1.mean() + min_d2.mean()
+
+    # Forward normal alignment: for each p_pred point, compare its normal with matched gt normal
+    n_gt_matched = torch.gather(n_gt, 1, idx1.unsqueeze(-1).expand(-1, -1, 3))
+    cos1 = torch.abs((n_pred * n_gt_matched).sum(dim=-1))
+    normal_loss1 = (1.0 - cos1).mean()
+
+    # Backward normal alignment: for each p_gt point, compare its normal with matched pred normal
+    n_pred_matched = torch.gather(n_pred, 1, idx2.unsqueeze(-1).expand(-1, -1, 3))
+    cos2 = torch.abs((n_gt * n_pred_matched).sum(dim=-1))
+    normal_loss2 = (1.0 - cos2).mean()
+
+    normal_loss = 0.5 * (normal_loss1 + normal_loss2)
+    nc_metric = 0.5 * (cos1.mean() + cos2.mean())
+
+    total_loss = cd_loss + lambda_normal * normal_loss
+    return total_loss, cd_loss, normal_loss, nc_metric
+
 
 

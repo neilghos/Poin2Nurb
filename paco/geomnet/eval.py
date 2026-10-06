@@ -19,7 +19,7 @@ from data import ABCDataset
 from model import GeomNet
 
 
-def compute_paco_metrics(pred_pts, gt_pts, gt_normals=None):
+def compute_paco_metrics(pred_pts, gt_pts, gt_normals=None, pred_normals=None):
     """
     Computes exact evaluation metrics following PaCo's evaluator.py:
       - Chamfer Distance (CD x 100) via cKDTree
@@ -51,14 +51,15 @@ def compute_paco_metrics(pred_pts, gt_pts, gt_normals=None):
 
     # 3. Normal Consistency (evaluator.py lines 234-240)
     if gt_normals is not None:
-        # Estimate normals on predicted point cloud via local covariance PCA
-        k = min(15, pred_pts.shape[0] - 1)
-        _, idxs = tree_pred.query(pred_pts, k=k)
-        neighbors = pred_pts[idxs]
-        centered = neighbors - neighbors.mean(axis=1, keepdims=True)
-        cov = np.einsum("nki, nkj -> nij", centered, centered)
-        _, v = np.linalg.eigh(cov)
-        pred_normals = v[:, :, 0]
+        if pred_normals is None:
+            # Fallback: estimate normals on predicted point cloud via local covariance PCA
+            k = min(15, pred_pts.shape[0] - 1)
+            _, idxs = tree_pred.query(pred_pts, k=k)
+            neighbors = pred_pts[idxs]
+            centered = neighbors - neighbors.mean(axis=1, keepdims=True)
+            cov = np.einsum("nki, nkj -> nij", centered, centered)
+            _, v = np.linalg.eigh(cov)
+            pred_normals = v[:, :, 0]
 
         # Exact dot-product formula from evaluator.py lines 237-240
         dot1 = np.abs(np.sum(pred_normals * gt_normals[corr_gt_ids], axis=1)).mean()
@@ -144,12 +145,16 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
     print(f"Evaluation size : {num_test_samples} shapes from test.txt")
 
     # 1. Load Model
-    model = GeomNet(embed_dim=256, num_patches=16, eval_res=16).to(device)
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device)
+        k_patches = ckpt.get("num_patches", 16)
+        r_eval = ckpt.get("eval_res", 16)
+        e_dim = ckpt.get("embed_dim", 256)
+        model = GeomNet(embed_dim=e_dim, num_patches=k_patches, eval_res=r_eval).to(device)
         model.load_state_dict(ckpt["model_state"])
-        print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (Test CD x 100: {ckpt.get('test_cd_x100', '?'):.2f})")
+        print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (K={k_patches} patches, Test CD x 100: {ckpt.get('test_cd_x100', '?'):.2f})")
     else:
+        model = GeomNet(embed_dim=256, num_patches=16, eval_res=16).to(device)
         print("Warning: Checkpoint not found, evaluating untrained initialization.")
 
     model.eval()
@@ -173,12 +178,13 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
             gt_n = batch["gt_normals"][0].cpu().numpy() if "gt_normals" in batch else None
             m_id = batch["model_id"][0]
 
-            out = model(pc_t)
+            out = model(pc_t, return_normals=True)
             pred_pts = out["surface_points"][0].cpu().numpy()
+            pred_n = out["surface_normals"][0].cpu().numpy() if "surface_normals" in out else None
             gt_pts = gt_t[0].cpu().numpy()
             pc_pts = pc_t[0].cpu().numpy()
 
-            metrics = compute_paco_metrics(pred_pts, gt_pts, gt_normals=gt_n)
+            metrics = compute_paco_metrics(pred_pts, gt_pts, gt_normals=gt_n, pred_normals=pred_n)
             cd_list.append(metrics["CD_x100"])
             hd_list.append(metrics["HD_x100"])
             if "NC" in metrics:

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from encoder import HierarchicalPointEncoder
-from decoder import NurbsDecoder, chamfer_distance
+from decoder import NurbsDecoder, chamfer_distance, chamfer_and_normal_loss
 
 
 class GeomNet(nn.Module):
@@ -14,23 +14,24 @@ class GeomNet(nn.Module):
       3. NurbsDecoder: K patch worker queries condition on the shape embedding,
          predicting control points P (B, K, 4, 4, 3) and rational weights W (B, K, 4, 4)
       4. DifferentiableNurbsEvaluator: Contraction of cubic Bernstein basis generates
-         dense surface point cloud (B, K * R * R, 3)
-      5. Loss: Direct symmetric Chamfer distance against complete ground truth (B, 8192, 3)
+         dense surface point cloud (B, K * R * R, 3) and analytical normals (B, K * R * R, 3)
+      5. Loss: Joint symmetric Chamfer distance and analytical normal alignment
     """
     def __init__(self, embed_dim=256, num_patches=16, eval_res=16):
         super().__init__()
         self.encoder = HierarchicalPointEncoder(in_channels=3, out_dim=embed_dim)
         self.decoder = NurbsDecoder(embed_dim=embed_dim, num_patches=num_patches, eval_res=eval_res)
 
-    def forward(self, pc):
+    def forward(self, pc, return_normals=True):
         """
         Args:
             pc: Incomplete point cloud scan of shape (B, 2048, 3)
+            return_normals: If True, evaluates analytical surface normals
         Returns:
-            dict with 'control_points', 'weights', 'surface_points'
+            dict with 'control_points', 'weights', 'surface_points', 'surface_normals'
         """
         shape_embedding = self.encoder(pc)
-        return self.decoder(shape_embedding)
+        return self.decoder(shape_embedding, return_normals=return_normals)
 
 
 if __name__ == "__main__":
