@@ -1,0 +1,32 @@
+# Data and large HDF5 archives
+data/
+*.h5
+*.hdf5
+*.zip
+*.tar*
+
+# PyTorch checkpoints and model weights
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+ckpt/
+output/
+
+# Python & environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+*.egg-info/
+
+# HTML visualizer files (can be large Plotly dumps)
+visualizations/*.html
+*.html
+
+# IDE & system caches
+.DS_Store
+.cache/
+.vscode/
+.idea/
