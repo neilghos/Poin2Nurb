@@ -13,7 +13,7 @@ class HierarchicalPointEncoder(nn.Module):
       3. Middle Tier: K Zonal Encoders (B, K, out_dim) via spatial distance-biased cross-attention
          anchored around learnable 3D zone centers
     """
-    def __init__(self, in_channels=3, out_dim=256, num_patches=32):
+    def __init__(self, in_channels=3, out_dim=128, num_patches=32):
         super().__init__()
         self.in_channels = in_channels
         self.out_dim = out_dim
@@ -21,40 +21,41 @@ class HierarchicalPointEncoder(nn.Module):
 
         # Level 1: Fine local features (3 -> 64)
         self.level1 = nn.Sequential(
-            nn.Conv1d(in_channels, 64, 1),
-            nn.BatchNorm1d(64),
+            nn.Conv1d(in_channels, 32, 1),
+            nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
-            nn.Conv1d(64, 64, 1),
+            nn.Conv1d(32, 64, 1),
             nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
         )
 
         # Level 2: Regional curvature features (64 -> 128)
         self.level2 = nn.Sequential(
+            nn.Conv1d(64, 64, 1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
             nn.Conv1d(64, 128, 1),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
+        )
+
+        # Level 3: Global macro features (128 -> 256)
+        self.level3 = nn.Sequential(
             nn.Conv1d(128, 128, 1),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
-        )
-
-        # Level 3: Global macro features (128 -> 512)
-        self.level3 = nn.Sequential(
             nn.Conv1d(128, 256, 1),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.Conv1d(256, 512, 1),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
         )
 
-        # Multi-scale global hierarchical fusion: (64 + 128 + 512 = 704 -> out_dim)
+        # Multi-scale global hierarchical fusion: (64 + 128 + 256 = 448 -> out_dim)
+        feat_dim = 64 + 128 + 256
         self.global_fusion = nn.Sequential(
-            nn.Linear(64 + 128 + 512, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(feat_dim, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.Linear(512, out_dim),
+            nn.Linear(256, out_dim),
         )
 
         # Initialize K zone anchors spread across the canonical CAD volume [-0.35, 0.35]^3 via spherical Fibonacci lattice
@@ -80,8 +81,8 @@ class HierarchicalPointEncoder(nn.Module):
 
         # Distance-biased spatial cross-attention projections
         self.to_q = nn.Linear(out_dim, out_dim)
-        self.to_k = nn.Linear(64 + 128 + 512, out_dim)
-        self.to_v = nn.Linear(64 + 128 + 512, out_dim)
+        self.to_k = nn.Linear(feat_dim, out_dim)
+        self.to_v = nn.Linear(feat_dim, out_dim)
         self.scale = 1.0 / math.sqrt(out_dim)
 
         # Learnable spatial distance penalty parameter gamma > 0

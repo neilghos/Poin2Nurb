@@ -17,7 +17,7 @@ class GeomNet(nn.Module):
          dense surface point cloud (B, K * R * R, 3) and analytical normals (B, K * R * R, 3)
       5. Loss: Joint symmetric Chamfer distance and analytical normal alignment
     """
-    def __init__(self, embed_dim=256, num_patches=32, eval_res=16):
+    def __init__(self, embed_dim=128, num_patches=32, eval_res=16):
         super().__init__()
         self.encoder = HierarchicalPointEncoder(in_channels=3, out_dim=embed_dim, num_patches=num_patches)
         self.decoder = NurbsDecoder(embed_dim=embed_dim, num_patches=num_patches, eval_res=eval_res)

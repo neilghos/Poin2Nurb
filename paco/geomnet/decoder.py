@@ -20,7 +20,7 @@ class DifferentiableNurbsEvaluator(nn.Module):
         b2 = 3.0 * (t ** 2) * (1.0 - t)
         b3 = t ** 3
         basis = torch.stack([b0, b1, b2, b3], dim=-1)  # shape: (R, 4)
-        self.register_buffer("basis", basis)
+        self.register_buffer("basis", basis, persistent=False)
 
         # Analytical first derivatives of cubic Bernstein basis with respect to t
         db0 = -3.0 * ((1.0 - t) ** 2)
@@ -28,7 +28,7 @@ class DifferentiableNurbsEvaluator(nn.Module):
         db2 = 6.0 * t * (1.0 - t) - 3.0 * (t ** 2)
         db3 = 3.0 * (t ** 2)
         d_basis = torch.stack([db0, db1, db2, db3], dim=-1)  # shape: (R, 4)
-        self.register_buffer("d_basis", d_basis)
+        self.register_buffer("d_basis", d_basis, persistent=False)
 
     def forward(self, control_points, weights=None, return_normals=True):
         """
@@ -86,10 +86,10 @@ class DifferentiableNurbsEvaluator(nn.Module):
 class NurbsDecoder(nn.Module):
     """
     Geometric Worker Decoder:
-    Given a global shape embedding, K patch workers predict
-    local control point grids P and rational weights W.
+    Given a global shape embedding and K zonal embeddings,
+    K patch workers predict local control point grids P and rational weights W.
     """
-    def __init__(self, embed_dim=256, num_patches=16, eval_res=16):
+    def __init__(self, embed_dim=128, num_patches=32, eval_res=16):
         super().__init__()
         self.num_patches = num_patches
         self.eval_res = eval_res
@@ -98,20 +98,20 @@ class NurbsDecoder(nn.Module):
         # Learnable worker query slots: (K, embed_dim)
         self.patch_queries = nn.Parameter(torch.randn(num_patches, embed_dim) * 0.02)
 
-        # Ground-level worker network
-        # Input features: [patch_query, zonal_feature, global_embedding] = 3 * embed_dim
+        # Ground-level worker network: takes [patch_query, zonal_feature, global_embedding]
+        hidden_dim = min(256, max(128, int(embed_dim * 1.5)))
         self.worker_mlp = nn.Sequential(
-            nn.Linear(embed_dim * 3, 256),
+            nn.Linear(embed_dim * 3, hidden_dim),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
 
         # Controller output heads:
         # Control points: 4 x 4 x 3 = 48 values per patch
-        self.cp_head = nn.Linear(256, 4 * 4 * 3)
+        self.cp_head = nn.Linear(hidden_dim, 4 * 4 * 3)
         # Rational weights: 4 x 4 = 16 values per patch (positive)
-        self.weight_head = nn.Linear(256, 4 * 4)
+        self.weight_head = nn.Linear(hidden_dim, 4 * 4)
 
     def forward(self, shape_embedding, zonal_embeddings=None, zone_anchors=None, return_normals=True):
         """

@@ -8,18 +8,25 @@ from torch.utils.data import DataLoader
 
 from data import ABCDataset
 from model import GeomNet
-from decoder import chamfer_distance, chamfer_and_normal_loss
+from decoder import chamfer_distance, chamfer_and_normal_loss, DifferentiableNurbsEvaluator
 
 
-def evaluate(model, test_loader, device, max_batches=None):
+def evaluate(model, test_loader, device, eval_res=16, max_batches=None):
     """
     Evaluates the model on held-out test shapes.
+    Evaluates at full benchmark resolution (eval_res=16 -> 8,192 points).
     Reports:
       - Raw Chamfer Distance
       - CD x 100 (Official PaCo CVPR 2025 Table 1 benchmark scale)
       - Normal Consistency (NC)
     """
     model.eval()
+    orig_res = model.decoder.eval_res
+    orig_evaluator = model.decoder.evaluator
+    if orig_res != eval_res:
+        model.decoder.evaluator = DifferentiableNurbsEvaluator(num_samples=eval_res).to(device)
+        model.decoder.eval_res = eval_res
+
     total_cd = 0.0
     total_nc = 0.0
     total_samples = 0
@@ -42,6 +49,10 @@ def evaluate(model, test_loader, device, max_batches=None):
             total_nc += nc.item() * batch_sz
             total_samples += batch_sz
 
+    # Restore training evaluator
+    model.decoder.evaluator = orig_evaluator
+    model.decoder.eval_res = orig_res
+
     mean_cd = total_cd / max(total_samples, 1)
     cd_x100 = mean_cd * 100.0
     mean_nc = total_nc / max(total_samples, 1)
@@ -54,8 +65,8 @@ def train(args):
     print(f"Device        : {device}")
     print(f"Batch Size    : {args.batch_size}")
     print(f"Learning Rate : {args.lr}")
-    print(f"Num Patches   : {args.num_patches} (eval resolution {args.eval_res}x{args.eval_res})")
-    print(f"Total Points  : {args.num_patches * args.eval_res * args.eval_res} per shape")
+    print(f"Num Patches   : {args.num_patches} (train res {args.train_eval_res}x{args.train_eval_res}, test res {args.eval_res}x{args.eval_res})")
+    print(f"Train Points  : {args.num_patches * args.train_eval_res * args.train_eval_res} per shape")
     print(f"Lambda Normal : {args.lambda_normal}")
     print(f"Epochs        : {args.epochs}")
     print(f"-----------------------------------------------")
@@ -86,7 +97,7 @@ def train(args):
     model = GeomNet(
         embed_dim=args.embed_dim,
         num_patches=args.num_patches,
-        eval_res=args.eval_res,
+        eval_res=args.train_eval_res,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -96,7 +107,9 @@ def train(args):
 
     # 3. Initial Baseline Evaluation before training
     print("\nRunning initial zero-shot test evaluation...")
-    init_cd, init_cd_x100, init_nc, n_eval = evaluate(model, test_loader, device, max_batches=args.test_eval_batches)
+    init_cd, init_cd_x100, init_nc, n_eval = evaluate(
+        model, test_loader, device, eval_res=args.eval_res, max_batches=args.test_eval_batches
+    )
     print(f"Initial Test CD x 100: {init_cd_x100:.2f} | Test NC: {init_nc:.4f} (evaluated on {n_eval} shapes)")
     print(f"PaCo SOTA Reference  : CD ~2.2 - 3.8 | NC: ~0.943\n")
 
@@ -153,9 +166,9 @@ def train(args):
         avg_train_cd = (train_cd_total / train_count) * 100.0
         avg_train_nc = train_nc_total / train_count
 
-        # Evaluate on Test Split
+        # Evaluate on Test Split (at full benchmark resolution eval_res=16)
         test_cd, test_cd_x100, test_nc, n_eval = evaluate(
-            model, test_loader, device, max_batches=args.test_eval_batches
+            model, test_loader, device, eval_res=args.eval_res, max_batches=args.test_eval_batches
         )
 
         is_best = test_cd_x100 < best_test_cd
@@ -200,16 +213,17 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train and Evaluate GeomNet on ABC Benchmark")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size (safe for 8 GB RAM)")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--embed_dim", type=int, default=256, help="Encoder embedding dimension")
+    parser.add_argument("--embed_dim", type=int, default=128, help="Encoder embedding dimension")
     parser.add_argument("--num_patches", type=int, default=32, help="Number of NURBS surface patches")
-    parser.add_argument("--eval_res", type=int, default=16, help="Resolution per patch (16x16=256 points)")
+    parser.add_argument("--train_eval_res", type=int, default=12, help="Patch resolution during training (12x12=144 pts/patch)")
+    parser.add_argument("--eval_res", type=int, default=16, help="Patch resolution during evaluation (16x16=256 pts/patch = 8192 pts total)")
     parser.add_argument("--lambda_normal", type=float, default=0.1, help="Weight for analytical normal alignment loss")
     parser.add_argument("--num_workers", type=int, default=0, help="0 workers to prevent RAM replication")
     parser.add_argument("--log_interval", type=int, default=100, help="Log step interval")
-    parser.add_argument("--test_eval_batches", type=int, default=25, help="Num test batches for validation (25*8=200 shapes)")
+    parser.add_argument("--test_eval_batches", type=int, default=15, help="Num test batches for validation (15*16=240 shapes)")
     parser.add_argument("--max_train_batches", type=int, default=None, help="Cap train steps per epoch for fast sanity checks")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Path to save weights")
 
