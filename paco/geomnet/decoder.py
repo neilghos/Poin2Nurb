@@ -206,10 +206,31 @@ def chamfer_distance(p1, p2, chunk_size=1024):
     return min_d1.mean() + min_d2.mean()
 
 
-def chamfer_and_normal_loss(p_pred, n_pred, p_gt, n_gt, lambda_normal=0.1):
+def control_point_laplacian_loss(cp):
     """
-    Joint Chamfer Distance and Analytical Normal Alignment Loss.
-    Uses the exact nearest-neighbor correspondences computed from torch.cdist.
+    Penalizes second-order discrete differences across the 4x4 control grid.
+    Acts as a 2D membrane stiffness prior, preventing pillowing and control point flaring.
+    cp: shape (B, K, 4, 4, 3)
+    """
+    diff_u = cp[:, :, 2:, :, :] - 2.0 * cp[:, :, 1:-1, :, :] + cp[:, :, :-2, :, :]
+    diff_v = cp[:, :, :, 2:, :] - 2.0 * cp[:, :, :, 1:-1, :] + cp[:, :, :, :-2, :]
+    return diff_u.pow(2).mean() + diff_v.pow(2).mean()
+
+
+def chamfer_and_normal_loss(
+    p_pred,
+    n_pred,
+    p_gt,
+    n_gt,
+    lambda_normal=0.1,
+    cp=None,
+    lambda_laplacian=0.01,
+    topk_ratio=0.05,
+    lambda_topk=0.5,
+):
+    """
+    Joint Chamfer Distance, Top-k Outlier Loss, Analytical Normal Alignment,
+    and 2D Control Grid Laplacian Regularizer.
     
     Args:
         p_pred: Predicted surface points (B, N, 3)
@@ -217,14 +238,18 @@ def chamfer_and_normal_loss(p_pred, n_pred, p_gt, n_gt, lambda_normal=0.1):
         p_gt: Ground truth surface points (B, M, 3)
         n_gt: Ground truth surface normals (B, M, 3)
         lambda_normal: Weight for symmetric normal alignment loss
+        cp: Control points (B, K, 4, 4, 3) for Laplacian stiffness regularization
+        lambda_laplacian: Weight for 2D control point Laplacian penalty
+        topk_ratio: Fraction of worst outlier points to penalize in Direction 1 (Pred->GT)
+        lambda_topk: Weight for top-k outlier penalty
     Returns:
-        total_loss, cd_loss, normal_loss, nc_metric
+        total_loss, cd_mean, normal_loss, nc_metric
     """
     dists = torch.cdist(p_pred, p_gt)  # (B, N, M)
-    min_d1, idx1 = dists.min(dim=2)    # (B, N)
-    min_d2, idx2 = dists.min(dim=1)    # (B, M)
+    min_d1, idx1 = dists.min(dim=2)    # (B, N) - Pred -> GT
+    min_d2, idx2 = dists.min(dim=1)    # (B, M) - GT -> Pred
 
-    cd_loss = min_d1.mean() + min_d2.mean()
+    cd_mean = min_d1.mean() + min_d2.mean()
 
     # Forward normal alignment: for each p_pred point, compare its normal with matched gt normal
     n_gt_matched = torch.gather(n_gt, 1, idx1.unsqueeze(-1).expand(-1, -1, 3))
@@ -239,8 +264,21 @@ def chamfer_and_normal_loss(p_pred, n_pred, p_gt, n_gt, lambda_normal=0.1):
     normal_loss = 0.5 * (normal_loss1 + normal_loss2)
     nc_metric = 0.5 * (cos1.mean() + cos2.mean())
 
-    total_loss = cd_loss + lambda_normal * normal_loss
-    return total_loss, cd_loss, normal_loss, nc_metric
+    total_loss = cd_mean + lambda_normal * normal_loss
+
+    # Top-k hard outlier penalty on Direction 1 (Pred -> GT) to crush boundary whiskers
+    if topk_ratio > 0.0 and lambda_topk > 0.0:
+        k = max(1, int(topk_ratio * min_d1.shape[1]))
+        topk_d1 = torch.topk(min_d1, k=k, dim=1)[0].mean()
+        total_loss = total_loss + lambda_topk * topk_d1
+
+    # 2D Control grid Laplacian stiffness to kill pillowing
+    if cp is not None and lambda_laplacian > 0.0:
+        lap_loss = control_point_laplacian_loss(cp)
+        total_loss = total_loss + lambda_laplacian * lap_loss
+
+    return total_loss, cd_mean, normal_loss, nc_metric
+
 
 
 

@@ -41,7 +41,14 @@ def evaluate(model, test_loader, device, eval_res=16, max_batches=None):
 
             out = model(pc, return_normals=True)
             _, cd, _, nc = chamfer_and_normal_loss(
-                out["surface_points"], out["surface_normals"], gt, gt_normals, lambda_normal=0.0
+                out["surface_points"],
+                out["surface_normals"],
+                gt,
+                gt_normals,
+                lambda_normal=0.0,
+                topk_ratio=0.0,
+                lambda_topk=0.0,
+                lambda_laplacian=0.0,
             )
 
             batch_sz = pc.shape[0]
@@ -100,20 +107,26 @@ def train(args):
         eval_res=args.train_eval_res,
     ).to(device)
 
+    if args.resume and os.path.exists(args.resume):
+        print(f"\n--> Loading checkpoint from {args.resume} for fine-tuning...")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        print(f"--> Successfully loaded weights (Epoch {ckpt.get('epoch', 'N/A')}, Test CD: {ckpt.get('test_cd_x100', 'N/A')})")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # 3. Initial Baseline Evaluation before training
-    print("\nRunning initial zero-shot test evaluation...")
+    print("\nRunning initial test evaluation...")
     init_cd, init_cd_x100, init_nc, n_eval = evaluate(
         model, test_loader, device, eval_res=args.eval_res, max_batches=args.test_eval_batches
     )
     print(f"Initial Test CD x 100: {init_cd_x100:.2f} | Test NC: {init_nc:.4f} (evaluated on {n_eval} shapes)")
     print(f"PaCo SOTA Reference  : CD ~2.2 - 3.8 | NC: ~0.943\n")
 
-    best_test_cd = float("inf")
+    best_test_cd = init_cd_x100 if args.resume else float("inf")
 
     # 4. Training Loop
     for epoch in range(1, args.epochs + 1):
@@ -134,7 +147,15 @@ def train(args):
             optimizer.zero_grad()
             out = model(pc, return_normals=True)
             total_loss, cd_loss, normal_loss, nc = chamfer_and_normal_loss(
-                out["surface_points"], out["surface_normals"], gt, gt_normals, lambda_normal=args.lambda_normal
+                out["surface_points"],
+                out["surface_normals"],
+                gt,
+                gt_normals,
+                lambda_normal=args.lambda_normal,
+                cp=out["control_points"],
+                lambda_laplacian=args.lambda_laplacian,
+                topk_ratio=args.topk_ratio,
+                lambda_topk=args.lambda_topk,
             )
             total_loss.backward()
 
@@ -174,33 +195,17 @@ def train(args):
         is_best = test_cd_x100 < best_test_cd
         if is_best:
             best_test_cd = test_cd_x100
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "num_patches": args.num_patches,
-                    "eval_res": args.eval_res,
-                    "embed_dim": args.embed_dim,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "test_cd_x100": test_cd_x100,
-                    "test_nc": test_nc,
-                },
-                os.path.join(args.checkpoint_dir, f"geomnet_k{args.num_patches}_best.pth"),
-            )
-            # Also maintain symlink/copy as geomnet_best.pth
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "num_patches": args.num_patches,
-                    "eval_res": args.eval_res,
-                    "embed_dim": args.embed_dim,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "test_cd_x100": test_cd_x100,
-                    "test_nc": test_nc,
-                },
-                os.path.join(args.checkpoint_dir, "geomnet_best.pth"),
-            )
+            save_payload = {
+                "epoch": epoch,
+                "num_patches": args.num_patches,
+                "eval_res": args.eval_res,
+                "embed_dim": args.embed_dim,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "test_cd_x100": test_cd_x100,
+                "test_nc": test_nc,
+            }
+            torch.save(save_payload, os.path.join(args.checkpoint_dir, args.save_name))
 
         star = " (*)" if is_best else ""
         print(f"\n>>> Epoch {epoch:2d} Summary [{epoch_dur:.1f}s]:")
@@ -226,6 +231,11 @@ if __name__ == "__main__":
     parser.add_argument("--test_eval_batches", type=int, default=15, help="Num test batches for validation (15*16=240 shapes)")
     parser.add_argument("--max_train_batches", type=int, default=None, help="Cap train steps per epoch for fast sanity checks")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Path to save weights")
+    parser.add_argument("--save_name", type=str, default="geomnet_best.pth", help="Checkpoint filename to save best weights")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for fine-tuning/resuming")
+    parser.add_argument("--lambda_laplacian", type=float, default=0.01, help="Weight for 2D control point Laplacian stiffness")
+    parser.add_argument("--topk_ratio", type=float, default=0.05, help="Top-k outlier ratio for Direction 1 Pred->GT")
+    parser.add_argument("--lambda_topk", type=float, default=0.5, help="Weight for top-k outlier penalty")
 
     args = parser.parse_args()
     train(args)
