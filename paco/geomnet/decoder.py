@@ -99,8 +99,9 @@ class NurbsDecoder(nn.Module):
         self.patch_queries = nn.Parameter(torch.randn(num_patches, embed_dim) * 0.02)
 
         # Ground-level worker network
+        # Input features: [patch_query, zonal_feature, global_embedding] = 3 * embed_dim
         self.worker_mlp = nn.Sequential(
-            nn.Linear(embed_dim * 2, 256),
+            nn.Linear(embed_dim * 3, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
@@ -112,10 +113,12 @@ class NurbsDecoder(nn.Module):
         # Rational weights: 4 x 4 = 16 values per patch (positive)
         self.weight_head = nn.Linear(256, 4 * 4)
 
-    def forward(self, shape_embedding, return_normals=True):
+    def forward(self, shape_embedding, zonal_embeddings=None, zone_anchors=None, return_normals=True):
         """
         Args:
-            shape_embedding: Tensor of shape (B, embed_dim)
+            shape_embedding: Tensor of shape (B, embed_dim) from Global Macro Encoder
+            zonal_embeddings: Optional tensor of shape (B, K, embed_dim) from K Zonal Encoders
+            zone_anchors: Optional tensor of shape (B, K, 3) 3D zone centers
             return_normals: If True, evaluates analytical surface normals
         Returns:
             dict containing:
@@ -129,14 +132,24 @@ class NurbsDecoder(nn.Module):
         # Expand patch queries across batch: (B, K, embed_dim)
         queries = self.patch_queries.unsqueeze(0).expand(B, -1, -1)
 
-        # Condition workers on global shape embedding: (B, K, 2 * embed_dim)
+        # Condition workers on global shape embedding: (B, K, embed_dim)
         emb_expanded = shape_embedding.unsqueeze(1).expand(-1, self.num_patches, -1)
-        worker_input = torch.cat([queries, emb_expanded], dim=-1)
+
+        if zonal_embeddings is not None:
+            worker_input = torch.cat([queries, zonal_embeddings, emb_expanded], dim=-1)
+        else:
+            worker_input = torch.cat([queries, emb_expanded, emb_expanded], dim=-1)
 
         feat = self.worker_mlp(worker_input)
 
         # Predict controllers
-        cp = self.cp_head(feat).reshape(B, self.num_patches, 4, 4, 3)
+        cp_delta = self.cp_head(feat).reshape(B, self.num_patches, 4, 4, 3)
+        if zone_anchors is not None:
+            # Anchor patches around their physical 3D zone centers
+            cp = cp_delta + zone_anchors.unsqueeze(2).unsqueeze(3)
+        else:
+            cp = cp_delta
+
         w = F.softplus(self.weight_head(feat)).reshape(B, self.num_patches, 4, 4) + 0.1
 
         # Evaluate continuous parametric surfaces
@@ -147,6 +160,7 @@ class NurbsDecoder(nn.Module):
                 "weights": w,
                 "surface_points": surface_points,
                 "surface_normals": surface_normals,
+                "zone_anchors": zone_anchors,
             }
         else:
             surface_points = self.evaluator(cp, w, return_normals=False)
@@ -154,6 +168,7 @@ class NurbsDecoder(nn.Module):
                 "control_points": cp,
                 "weights": w,
                 "surface_points": surface_points,
+                "zone_anchors": zone_anchors,
             }
 
 

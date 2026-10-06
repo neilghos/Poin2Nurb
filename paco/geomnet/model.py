@@ -17,9 +17,9 @@ class GeomNet(nn.Module):
          dense surface point cloud (B, K * R * R, 3) and analytical normals (B, K * R * R, 3)
       5. Loss: Joint symmetric Chamfer distance and analytical normal alignment
     """
-    def __init__(self, embed_dim=256, num_patches=16, eval_res=16):
+    def __init__(self, embed_dim=256, num_patches=32, eval_res=16):
         super().__init__()
-        self.encoder = HierarchicalPointEncoder(in_channels=3, out_dim=embed_dim)
+        self.encoder = HierarchicalPointEncoder(in_channels=3, out_dim=embed_dim, num_patches=num_patches)
         self.decoder = NurbsDecoder(embed_dim=embed_dim, num_patches=num_patches, eval_res=eval_res)
 
     def forward(self, pc, return_normals=True):
@@ -28,10 +28,15 @@ class GeomNet(nn.Module):
             pc: Incomplete point cloud scan of shape (B, 2048, 3)
             return_normals: If True, evaluates analytical surface normals
         Returns:
-            dict with 'control_points', 'weights', 'surface_points', 'surface_normals'
+            dict with 'control_points', 'weights', 'surface_points', 'surface_normals', 'zone_anchors'
         """
-        shape_embedding = self.encoder(pc)
-        return self.decoder(shape_embedding, return_normals=return_normals)
+        global_emb, zonal_embs, zone_anchors = self.encoder(pc)
+        return self.decoder(
+            global_emb,
+            zonal_embeddings=zonal_embs,
+            zone_anchors=zone_anchors,
+            return_normals=return_normals,
+        )
 
 
 if __name__ == "__main__":
