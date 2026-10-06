@@ -11,10 +11,50 @@ from model import GeomNet
 from decoder import chamfer_distance, chamfer_and_normal_loss, DifferentiableNurbsEvaluator
 
 
+class CUDAPrefetcher:
+    """
+    Asynchronous CUDA Stream Prefetcher.
+    Overlaps CPU Disk I/O / DataLoader tensor batching with GPU forward & backward execution.
+    """
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream()
+        self.loader_iter = iter(loader)
+        self.next_batch = None
+        self.preload()
+
+    def preload(self):
+        try:
+            self.next_batch = next(self.loader_iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            for k, v in self.next_batch.items():
+                if isinstance(v, torch.Tensor):
+                    self.next_batch[k] = v.to(self.device, non_blocking=True)
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        if batch is None:
+            raise StopIteration
+        self.preload()
+        return batch
+
+
 def evaluate(model, test_loader, device, eval_res=16, max_batches=None):
     """
     Evaluates the model on held-out test shapes.
-    Evaluates at full benchmark resolution (eval_res=16 -> 8,192 points).
+    Evaluates at full benchmark resolution (eval_res=16 -> 8,192 points) and full 8,192 GT points.
     Reports:
       - Raw Chamfer Distance
       - CD x 100 (Official PaCo CVPR 2025 Table 1 benchmark scale)
@@ -35,14 +75,16 @@ def evaluate(model, test_loader, device, eval_res=16, max_batches=None):
         for i, batch in enumerate(test_loader):
             if max_batches is not None and i >= max_batches:
                 break
-            pc = batch["pc"].to(device)
-            gt = batch["gt"].to(device)
-            gt_normals = batch["gt_normals"].to(device)
+            pc = batch["pc"].to(device, non_blocking=True)
+            gt = batch["gt"].to(device, non_blocking=True)
+            gt_normals = batch["gt_normals"].to(device, non_blocking=True)
 
-            out = model(pc, return_normals=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = model(pc, return_normals=True)
+
             _, cd, _, nc = chamfer_and_normal_loss(
-                out["surface_points"],
-                out["surface_normals"],
+                out["surface_points"].float(),
+                out["surface_normals"].float(),
                 gt,
                 gt_normals,
                 lambda_normal=0.0,
@@ -69,13 +111,15 @@ def evaluate(model, test_loader, device, eval_res=16, max_batches=None):
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"=== Starting GeomNet Training & Evaluation ===")
-    print(f"Device        : {device}")
-    print(f"Batch Size    : {args.batch_size}")
-    print(f"Learning Rate : {args.lr}")
-    print(f"Num Patches   : {args.num_patches} (train res {args.train_eval_res}x{args.train_eval_res}, test res {args.eval_res}x{args.eval_res})")
-    print(f"Train Points  : {args.num_patches * args.train_eval_res * args.train_eval_res} per shape")
-    print(f"Lambda Normal : {args.lambda_normal}")
-    print(f"Epochs        : {args.epochs}")
+    print(f"Device          : {device}")
+    print(f"Batch Size      : {args.batch_size} (eval batch size: {args.eval_batch_size})")
+    print(f"Train GT Points : {args.train_gt_points if args.train_gt_points > 0 else 'Full (8192)'} (stochastic sampling)")
+    print(f"Learning Rate   : {args.lr}")
+    print(f"Num Patches     : {args.num_patches} (train res {args.train_eval_res}x{args.train_eval_res}, test res {args.eval_res}x{args.eval_res})")
+    print(f"Train Pred Pts  : {args.num_patches * args.train_eval_res * args.train_eval_res} per shape")
+    print(f"Regularization  : Top-k (k={args.topk_ratio}, weight={args.lambda_topk}) + Laplacian (weight={args.lambda_laplacian})")
+    print(f"Lambda Normal   : {args.lambda_normal}")
+    print(f"Epochs          : {args.epochs}")
     print(f"-----------------------------------------------")
 
     # 1. Datasets & Loaders
@@ -91,14 +135,14 @@ def train(args):
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
     )
 
-    print(f"Train shapes : {len(train_dataset)}")
-    print(f"Test shapes  : {len(test_dataset)}")
+    print(f"Train shapes    : {len(train_dataset)} ({len(train_loader)} batches/epoch)")
+    print(f"Test shapes     : {len(test_dataset)}")
 
     # 2. Model & Optimizer
     model = GeomNet(
@@ -137,22 +181,34 @@ def train(args):
         train_count = 0
         start_time = time.time()
 
-        for step, batch in enumerate(train_loader):
+        prefetcher = CUDAPrefetcher(train_loader, device=device)
+        for step, batch in enumerate(prefetcher):
             if args.max_train_batches is not None and step >= args.max_train_batches:
                 break
-            pc = batch["pc"].to(device)
-            gt = batch["gt"].to(device)
-            gt_normals = batch["gt_normals"].to(device)
+            pc = batch["pc"]
+            gt = batch["gt"]
+            gt_normals = batch["gt_normals"]
+
+            # Stochastic GT point sampling: 4x faster cdist + continuous surface augmentation
+            if args.train_gt_points and 0 < args.train_gt_points < gt.shape[1]:
+                sub_idx = torch.randint(0, gt.shape[1], (args.train_gt_points,), device=device)
+                gt_train = gt[:, sub_idx, :]
+                gt_normals_train = gt_normals[:, sub_idx, :]
+            else:
+                gt_train = gt
+                gt_normals_train = gt_normals
 
             optimizer.zero_grad()
-            out = model(pc, return_normals=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = model(pc, return_normals=True)
+
             total_loss, cd_loss, normal_loss, nc = chamfer_and_normal_loss(
-                out["surface_points"],
-                out["surface_normals"],
-                gt,
-                gt_normals,
+                out["surface_points"].float(),
+                out["surface_normals"].float(),
+                gt_train,
+                gt_normals_train,
                 lambda_normal=args.lambda_normal,
-                cp=out["control_points"],
+                cp=out["control_points"].float(),
                 lambda_laplacian=args.lambda_laplacian,
                 topk_ratio=args.topk_ratio,
                 lambda_topk=args.lambda_topk,
@@ -187,7 +243,7 @@ def train(args):
         avg_train_cd = (train_cd_total / train_count) * 100.0
         avg_train_nc = train_nc_total / train_count
 
-        # Evaluate on Test Split (at full benchmark resolution eval_res=16)
+        # Evaluate on Test Split (at full benchmark resolution eval_res=16 and full 8192 GT points)
         test_cd, test_cd_x100, test_nc, n_eval = evaluate(
             model, test_loader, device, eval_res=args.eval_res, max_batches=args.test_eval_batches
         )
@@ -219,7 +275,9 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train and Evaluate GeomNet on ABC Benchmark")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size for evaluation")
+    parser.add_argument("--train_gt_points", type=int, default=2048, help="Number of GT points to sample during training (default 2048 for 4x speedup, 0 for all 8192)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--embed_dim", type=int, default=128, help="Encoder embedding dimension")
     parser.add_argument("--num_patches", type=int, default=32, help="Number of NURBS surface patches")
@@ -227,7 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_res", type=int, default=16, help="Patch resolution during evaluation (16x16=256 pts/patch = 8192 pts total)")
     parser.add_argument("--lambda_normal", type=float, default=0.1, help="Weight for analytical normal alignment loss")
     parser.add_argument("--num_workers", type=int, default=0, help="0 workers to prevent RAM replication")
-    parser.add_argument("--log_interval", type=int, default=100, help="Log step interval")
+    parser.add_argument("--log_interval", type=int, default=50, help="Log step interval")
     parser.add_argument("--test_eval_batches", type=int, default=15, help="Num test batches for validation (15*16=240 shapes)")
     parser.add_argument("--max_train_batches", type=int, default=None, help="Cap train steps per epoch for fast sanity checks")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Path to save weights")
@@ -239,3 +297,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     train(args)
+
