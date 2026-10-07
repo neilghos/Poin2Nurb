@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import argparse
 import torch
 import torch.nn as nn
@@ -119,6 +120,7 @@ def train(args):
     print(f"Train Pred Pts  : {args.num_patches * args.train_eval_res * args.train_eval_res} per shape")
     print(f"Regularization  : Top-k (k={args.topk_ratio}, weight={args.lambda_topk}) + Laplacian (weight={args.lambda_laplacian})")
     print(f"Lambda Normal   : {args.lambda_normal}")
+    print(f"Macro GNN       : {'Enabled (Tier 2 inter-zone coordination)' if args.macro_gnn else 'Disabled (original baseline)'}")
     print(f"Epochs          : {args.epochs}")
     print(f"-----------------------------------------------")
 
@@ -149,17 +151,28 @@ def train(args):
         embed_dim=args.embed_dim,
         num_patches=args.num_patches,
         eval_res=args.train_eval_res,
+        use_macro_gnn=args.macro_gnn,
     ).to(device)
 
     if args.resume and os.path.exists(args.resume):
         print(f"\n--> Loading checkpoint from {args.resume} for fine-tuning...")
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model_state"])
-        print(f"--> Successfully loaded weights (Epoch {ckpt.get('epoch', 'N/A')}, Test CD: {ckpt.get('test_cd_x100', 'N/A')})")
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    steps_per_epoch = args.max_train_batches if args.max_train_batches is not None else len(train_loader)
+    total_steps = args.epochs * steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=total_steps,
+        pct_start=args.warmup_pct,
+        anneal_strategy="cos",
+        div_factor=10.0,
+        final_div_factor=100.0,
+    )
+    sched_desc = f"OneCycleLR (peak LR={args.lr:.4f}, warmup {args.warmup_pct*100:.1f}%, total steps={total_steps})"
 
+    print(f"Scheduler       : {sched_desc}")
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # 3. Initial Baseline Evaluation before training
@@ -218,6 +231,7 @@ def train(args):
             # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
+            scheduler.step()
 
             bs = pc.shape[0]
             train_loss += total_loss.item() * bs
@@ -238,7 +252,7 @@ def train(args):
                     f"Speed: {shapes_per_sec:.1f} shapes/s"
                 )
 
-        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
         epoch_dur = time.time() - start_time
         avg_train_cd = (train_cd_total / train_count) * 100.0
         avg_train_nc = train_nc_total / train_count
@@ -256,6 +270,7 @@ def train(args):
                 "num_patches": args.num_patches,
                 "eval_res": args.eval_res,
                 "embed_dim": args.embed_dim,
+                "use_macro_gnn": args.macro_gnn,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "test_cd_x100": test_cd_x100,
@@ -264,7 +279,7 @@ def train(args):
             torch.save(save_payload, os.path.join(args.checkpoint_dir, args.save_name))
 
         star = " (*)" if is_best else ""
-        print(f"\n>>> Epoch {epoch:2d} Summary [{epoch_dur:.1f}s]:")
+        print(f"\n>>> Epoch {epoch:2d}/{args.epochs:2d} Summary [{epoch_dur:.1f}s | LR: {current_lr:.6f}]:")
         print(f"    Train CD x 100 : {avg_train_cd:.2f} | Train NC: {avg_train_nc:.4f}")
         print(f"    Test  CD x 100 : {test_cd_x100:.2f} | Test  NC: {test_nc:.4f} (evaluated on {n_eval} test shapes){star}")
         print(f"    Best  CD x 100 : {best_test_cd:.2f} | PaCo SOTA Ref: ~2.2 - 3.8 / NC: 0.943\n")
@@ -274,11 +289,14 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train and Evaluate GeomNet on ABC Benchmark")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs (default 100)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate for OneCycleLR")
+    parser.add_argument("--warmup_pct", type=float, default=0.05, help="Warmup fraction of total steps (default 0.05 = 5% warmup)")
+    parser.add_argument("--macro_gnn", action="store_true", default=True, help="Enable Tier 2 Macro GNN inter-zone message passing (default True)")
+    parser.add_argument("--no_macro_gnn", dest="macro_gnn", action="store_false", help="Disable Tier 2 Macro GNN (ablation to original baseline)")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size for evaluation")
     parser.add_argument("--train_gt_points", type=int, default=2048, help="Number of GT points to sample during training (default 2048 for 4x speedup, 0 for all 8192)")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--embed_dim", type=int, default=128, help="Encoder embedding dimension")
     parser.add_argument("--num_patches", type=int, default=32, help="Number of NURBS surface patches")
     parser.add_argument("--train_eval_res", type=int, default=12, help="Patch resolution during training (12x12=144 pts/patch)")
@@ -297,4 +315,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     train(args)
+
+
 

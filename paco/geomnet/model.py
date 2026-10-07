@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from encoder import HierarchicalPointEncoder
+from macro_gnn import MacroGNN
 from decoder import NurbsDecoder, chamfer_distance, chamfer_and_normal_loss
 
 
@@ -10,16 +11,30 @@ class GeomNet(nn.Module):
     
     Data Flow:
       1. Input: Partial point cloud scan (B, 2048, 3)
-      2. HierarchicalPointEncoder: Extracts multi-scale geometric shape embedding (B, 256)
-      3. NurbsDecoder: K patch worker queries condition on the shape embedding,
-         predicting control points P (B, K, 4, 4, 3) and rational weights W (B, K, 4, 4)
-      4. DifferentiableNurbsEvaluator: Contraction of cubic Bernstein basis generates
+      2. HierarchicalPointEncoder: Multi-scale point convs + K zonal spatial cross-attention
+      3. MacroGNN (Tier 2): 2-layer Graph Attention over the K zone nodes using 3D anchor
+         coordinates to coordinate boundary features and topological continuity
+      4. NurbsDecoder: K patch worker MLPs predict control points P (B, K, 4, 4, 3)
+         and rational weights W (B, K, 4, 4)
+      5. DifferentiableNurbsEvaluator: Contraction of cubic Bernstein basis generates
          dense surface point cloud (B, K * R * R, 3) and analytical normals (B, K * R * R, 3)
-      5. Loss: Joint symmetric Chamfer distance and analytical normal alignment
     """
-    def __init__(self, embed_dim=128, num_patches=32, eval_res=16):
+    def __init__(
+        self,
+        embed_dim=128,
+        num_patches=32,
+        eval_res=16,
+        use_macro_gnn=True,
+        k_neighbors=6,
+        gnn_layers=2,
+    ):
         super().__init__()
+        self.use_macro_gnn = use_macro_gnn
         self.encoder = HierarchicalPointEncoder(in_channels=3, out_dim=embed_dim, num_patches=num_patches)
+        if use_macro_gnn:
+            self.macro_gnn = MacroGNN(embed_dim=embed_dim, k_neighbors=k_neighbors, num_layers=gnn_layers)
+        else:
+            self.macro_gnn = None
         self.decoder = NurbsDecoder(embed_dim=embed_dim, num_patches=num_patches, eval_res=eval_res)
 
     def forward(self, pc, return_normals=True):
@@ -31,9 +46,14 @@ class GeomNet(nn.Module):
             dict with 'control_points', 'weights', 'surface_points', 'surface_normals', 'zone_anchors'
         """
         global_emb, zonal_embs, zone_anchors = self.encoder(pc)
+        if self.use_macro_gnn and self.macro_gnn is not None:
+            zonal_features = self.macro_gnn(zonal_embs, zone_anchors)
+        else:
+            zonal_features = zonal_embs
+
         return self.decoder(
             global_emb,
-            zonal_embeddings=zonal_embs,
+            zonal_embeddings=zonal_features,
             zone_anchors=zone_anchors,
             return_normals=return_normals,
         )
