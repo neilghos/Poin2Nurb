@@ -137,19 +137,20 @@ def save_interactive_visualization(pc, pred, gt, model_id, output_path="visualiz
     return file_path
 
 
-def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samples=100, num_viz=5):
+def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samples=100, num_viz=5, eval_points=10000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=== PaCo Benchmark Evaluation & Visualization ===")
     print(f"Device          : {device}")
     print(f"Checkpoint      : {checkpoint_path}")
     print(f"Evaluation size : {num_test_samples} shapes from test.txt")
+    print(f"Sampled points  : {eval_points if eval_points else 'Native grid'} per model (CVPR 2025 Table 1 aligned)")
 
     # 1. Load Model
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device)
-        k_patches = ckpt.get("num_patches", 16)
+        k_patches = ckpt.get("num_patches", 32)
         r_eval = ckpt.get("eval_res", 16)
-        e_dim = ckpt.get("embed_dim", 256)
+        e_dim = ckpt.get("embed_dim", 192)
         use_gnn = ckpt.get("use_macro_gnn", any("macro_gnn" in k for k in ckpt.get("model_state", {}).keys()))
         model = GeomNet(
             embed_dim=e_dim,
@@ -161,8 +162,15 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
         gnn_str = "with Macro GNN" if use_gnn else "without Macro GNN"
         print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (K={k_patches} patches, {gnn_str}, Test CD x 100: {ckpt.get('test_cd_x100', '?'):.2f})")
     else:
-        model = GeomNet(embed_dim=256, num_patches=16, eval_res=16, use_macro_gnn=True).to(device)
+        k_patches = 32
+        model = GeomNet(embed_dim=192, num_patches=32, eval_res=16, use_macro_gnn=True).to(device)
         print("Warning: Checkpoint not found, evaluating untrained initialization.")
+
+    # If evaluating fixed number of points (e.g. 10,000), adjust decoder grid resolution dynamically
+    if eval_points:
+        req_res = int(np.ceil(np.sqrt(eval_points / k_patches)))
+        model.decoder.eval_res = req_res
+        model.decoder.evaluator = type(model.decoder.evaluator)(num_samples=req_res).to(device)
 
     model.eval()
 
@@ -188,6 +196,14 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
             out = model(pc_t, return_normals=True)
             pred_pts = out["surface_points"][0].cpu().numpy()
             pred_n = out["surface_normals"][0].cpu().numpy() if "surface_normals" in out else None
+
+            # Subsample to exact eval_points if needed
+            if eval_points and len(pred_pts) > eval_points:
+                sample_idx = np.linspace(0, len(pred_pts) - 1, eval_points, dtype=int)
+                pred_pts = pred_pts[sample_idx]
+                if pred_n is not None:
+                    pred_n = pred_n[sample_idx]
+
             gt_pts = gt_t[0].cpu().numpy()
             pc_pts = pc_t[0].cpu().numpy()
 
@@ -210,6 +226,7 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
 
     print("\n================ FINAL EVALUATION REPORT (TABLE 1 METRICS) ================")
     print(f"  Models evaluated         : {len(cd_list)}")
+    print(f"  Sampled surface points   : {eval_points if eval_points else len(pred_pts)} pts (CVPR Table 1)")
     print(f"  Chamfer Distance (CDx100): {mean_cd_x100:.2f} (Median: {median_cd_x100:.2f})")
     print(f"  Hausdorff Dist   (HDx100): {mean_hd_x100:.2f}")
     print(f"  Normal Consistency (NC)  : {mean_nc:.4f}")
@@ -226,9 +243,10 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default="checkpoints/geomnet_best.pth")
+    parser.add_argument("--ckpt", type=str, default="checkpoints/geomnet_200e.pth")
     parser.add_argument("--samples", type=int, default=50)
     parser.add_argument("--viz", type=int, default=3)
+    parser.add_argument("--points", type=int, default=10000, help="Number of surface points to evaluate (default: 10,000 for CVPR Table 1)")
     args = parser.parse_args()
 
-    run_evaluation(checkpoint_path=args.ckpt, num_test_samples=args.samples, num_viz=args.viz)
+    run_evaluation(checkpoint_path=args.ckpt, num_test_samples=args.samples, num_viz=args.viz, eval_points=args.points)

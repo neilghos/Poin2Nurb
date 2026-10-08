@@ -257,7 +257,7 @@ def train(args):
         avg_train_cd = (train_cd_total / train_count) * 100.0
         avg_train_nc = train_nc_total / train_count
 
-        # Evaluate on Test Split (at full benchmark resolution eval_res=16 and full 8192 GT points)
+        # Evaluate on 1 Split (at full benchmark resolution eval_res=16 and full 8192 GT points)
         test_cd, test_cd_x100, test_nc, n_eval = evaluate(
             model, test_loader, device, eval_res=args.eval_res, max_batches=args.test_eval_batches
         )
@@ -282,7 +282,7 @@ def train(args):
         print(f"\n>>> Epoch {epoch:2d}/{args.epochs:2d} Summary [{epoch_dur:.1f}s | LR: {current_lr:.6f}]:")
         print(f"    Train CD x 100 : {avg_train_cd:.2f} | Train NC: {avg_train_nc:.4f}")
         print(f"    Test  CD x 100 : {test_cd_x100:.2f} | Test  NC: {test_nc:.4f} (evaluated on {n_eval} test shapes){star}")
-        print(f"    Best  CD x 100 : {best_test_cd:.2f} | PaCo SOTA Ref: ~2.2 - 3.8 / NC: 0.943\n")
+        print(f"    Best  CD x 100 : {best_test_cd:.2f} | Definitive SOTA Ref: ~1.6 - 1.8 / NC: 0.950\n")
 
     print(f"Training completed. Best Test CD x 100: {best_test_cd:.2f}")
 
