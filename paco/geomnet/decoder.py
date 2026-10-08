@@ -83,10 +83,30 @@ class DifferentiableNurbsEvaluator(nn.Module):
             return surface_points
 
 
+class ResidualMLPBlock(nn.Module):
+    """
+    Residual MLP Block with LayerNorm for coordinate regression.
+    Preserves gradient flow and stabilizes continuous spline outputs.
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        res = x
+        out = self.act(self.norm1(self.fc1(x)))
+        out = self.norm2(self.fc2(out))
+        return self.act(res + out)
+
+
 class NurbsDecoder(nn.Module):
     """
     Geometric Worker Decoder:
-    Given a global shape embedding and K zonal embeddings,
+    Given a global shape embedding, K zonal embeddings, and 3D zone anchors,
     K patch workers predict local control point grids P and rational weights W.
     """
     def __init__(self, embed_dim=128, num_patches=32, eval_res=16):
@@ -98,14 +118,17 @@ class NurbsDecoder(nn.Module):
         # Learnable worker query slots: (K, embed_dim)
         self.patch_queries = nn.Parameter(torch.randn(num_patches, embed_dim) * 0.02)
 
-        # Ground-level worker network: takes [patch_query, zonal_feature, global_embedding]
-        hidden_dim = min(256, max(128, int(embed_dim * 1.5)))
-        self.worker_mlp = nn.Sequential(
-            nn.Linear(embed_dim * 3, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+        # Ground-level worker network: takes [patch_query, zonal_feature, global_embedding, zone_anchor]
+        in_dim = embed_dim * 3 + 3
+        hidden_dim = max(256, embed_dim * 2)
+
+        self.in_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2, inplace=True),
         )
+        self.res1 = ResidualMLPBlock(hidden_dim)
+        self.res2 = ResidualMLPBlock(hidden_dim)
 
         # Controller output heads:
         # Control points: 4 x 4 x 3 = 48 values per patch
@@ -135,12 +158,14 @@ class NurbsDecoder(nn.Module):
         # Condition workers on global shape embedding: (B, K, embed_dim)
         emb_expanded = shape_embedding.unsqueeze(1).expand(-1, self.num_patches, -1)
 
-        if zonal_embeddings is not None:
-            worker_input = torch.cat([queries, zonal_embeddings, emb_expanded], dim=-1)
-        else:
-            worker_input = torch.cat([queries, emb_expanded, emb_expanded], dim=-1)
+        z_feat = zonal_embeddings if zonal_embeddings is not None else emb_expanded
+        anchors = zone_anchors if zone_anchors is not None else torch.zeros(B, self.num_patches, 3, device=queries.device, dtype=queries.dtype)
 
-        feat = self.worker_mlp(worker_input)
+        worker_input = torch.cat([queries, z_feat, emb_expanded, anchors], dim=-1)
+
+        feat = self.in_proj(worker_input)
+        feat = self.res1(feat)
+        feat = self.res2(feat)
 
         # Predict controllers
         cp_delta = self.cp_head(feat).reshape(B, self.num_patches, 4, 4, 3)
