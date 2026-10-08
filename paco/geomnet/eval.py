@@ -17,6 +17,7 @@ from plotly.subplots import make_subplots
 
 from data import ABCDataset
 from model import GeomNet
+from decoder import DifferentiableNurbsEvaluator
 
 
 def compute_paco_metrics(pred_pts, gt_pts, gt_normals=None, pred_normals=None):
@@ -149,6 +150,7 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device)
         k_patches = ckpt.get("num_patches", 32)
+        deg = ckpt.get("patch_degree", 3)
         r_eval = ckpt.get("eval_res", 16)
         e_dim = ckpt.get("embed_dim", 192)
         use_gnn = ckpt.get("use_macro_gnn", any("macro_gnn" in k for k in ckpt.get("model_state", {}).keys()))
@@ -157,20 +159,25 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
             num_patches=k_patches,
             eval_res=r_eval,
             use_macro_gnn=use_gnn,
+            patch_degree=deg,
         ).to(device)
         model.load_state_dict(ckpt["model_state"])
         gnn_str = "with Macro GNN" if use_gnn else "without Macro GNN"
-        print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (K={k_patches} patches, {gnn_str}, Test CD x 100: {ckpt.get('test_cd_x100', '?'):.2f})")
+        deg_str = f"{deg+1}x{deg+1} (degree {deg})"
+        print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (K={k_patches} patches, {deg_str}, {gnn_str}, Test CD x 100: {ckpt.get('test_cd_x100', '?'):.2f})")
     else:
         k_patches = 32
-        model = GeomNet(embed_dim=192, num_patches=32, eval_res=16, use_macro_gnn=True).to(device)
+        deg = 5
+        model = GeomNet(embed_dim=192, num_patches=32, eval_res=16, use_macro_gnn=True, patch_degree=deg).to(device)
         print("Warning: Checkpoint not found, evaluating untrained initialization.")
 
     # If evaluating fixed number of points (e.g. 10,000), adjust decoder grid resolution dynamically
     if eval_points:
         req_res = int(np.ceil(np.sqrt(eval_points / k_patches)))
         model.decoder.eval_res = req_res
-        model.decoder.evaluator = type(model.decoder.evaluator)(num_samples=req_res).to(device)
+        model.decoder.evaluator = DifferentiableNurbsEvaluator(
+            num_samples=req_res, degree=model.decoder.patch_degree
+        ).to(device)
 
     model.eval()
 

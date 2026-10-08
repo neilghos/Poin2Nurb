@@ -27,15 +27,22 @@ class GeomNet(nn.Module):
         use_macro_gnn=True,
         k_neighbors=6,
         gnn_layers=2,
+        patch_degree=3,
     ):
         super().__init__()
+        self.patch_degree = patch_degree
         self.use_macro_gnn = use_macro_gnn
         self.encoder = HierarchicalPointEncoder(in_channels=3, out_dim=embed_dim, num_patches=num_patches)
         if use_macro_gnn:
             self.macro_gnn = MacroGNN(embed_dim=embed_dim, k_neighbors=k_neighbors, num_layers=gnn_layers)
         else:
             self.macro_gnn = None
-        self.decoder = NurbsDecoder(embed_dim=embed_dim, num_patches=num_patches, eval_res=eval_res)
+        self.decoder = NurbsDecoder(
+            embed_dim=embed_dim,
+            num_patches=num_patches,
+            eval_res=eval_res,
+            patch_degree=patch_degree,
+        )
 
     def forward(self, pc, return_normals=True):
         """

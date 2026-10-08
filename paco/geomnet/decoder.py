@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,28 +7,41 @@ import torch.nn.functional as F
 class DifferentiableNurbsEvaluator(nn.Module):
     """
     Differentiable B-Spline / NURBS Surface Patch Evaluator.
-    Evaluates degree-3 (bicubic) patches with 4x4 control point grids
+    Evaluates degree-d patches with (d+1) x (d+1) control point grids
     across an (R x R) evaluation parameter grid using tensor contraction.
     """
-    def __init__(self, num_samples=16):
+    def __init__(self, num_samples=16, degree=3):
         super().__init__()
         self.num_samples = num_samples
+        self.degree = degree
+        G = degree + 1
 
-        # Analytical cubic Bernstein basis on [0, 1]
-        t = torch.linspace(0.0, 1.0, num_samples)
-        b0 = (1.0 - t) ** 3
-        b1 = 3.0 * t * ((1.0 - t) ** 2)
-        b2 = 3.0 * (t ** 2) * (1.0 - t)
-        b3 = t ** 3
-        basis = torch.stack([b0, b1, b2, b3], dim=-1)  # shape: (R, 4)
+        # Analytical Bernstein basis on [0, 1] and analytical first derivatives
+        t = torch.linspace(0.0, 1.0, num_samples, dtype=torch.float32)
+        basis_list = []
+        dbasis_list = []
+
+        for i in range(G):
+            coeff = float(math.comb(degree, i))
+            term_t = torch.where((t == 0) & (i == 0), torch.ones_like(t), t ** i)
+            term_1_t = torch.where((t == 1) & (degree - i == 0), torch.ones_like(t), (1.0 - t) ** (degree - i))
+            b = coeff * term_t * term_1_t
+            basis_list.append(b)
+
+            if i == 0:
+                db = -float(degree) * ((1.0 - t) ** (degree - 1))
+            elif i == degree:
+                db = float(degree) * (t ** (degree - 1))
+            else:
+                t1 = i * torch.where((t == 0) & (i - 1 == 0), torch.ones_like(t), t ** (i - 1)) * ((1.0 - t) ** (degree - i))
+                t2 = (degree - i) * (t ** i) * torch.where((t == 1) & (degree - i - 1 == 0), torch.ones_like(t), (1.0 - t) ** (degree - i - 1))
+                db = coeff * (t1 - t2)
+            dbasis_list.append(db)
+
+        basis = torch.stack(basis_list, dim=-1)   # shape: (R, G)
         self.register_buffer("basis", basis, persistent=False)
 
-        # Analytical first derivatives of cubic Bernstein basis with respect to t
-        db0 = -3.0 * ((1.0 - t) ** 2)
-        db1 = 3.0 * ((1.0 - t) ** 2) - 6.0 * t * (1.0 - t)
-        db2 = 6.0 * t * (1.0 - t) - 3.0 * (t ** 2)
-        db3 = 3.0 * (t ** 2)
-        d_basis = torch.stack([db0, db1, db2, db3], dim=-1)  # shape: (R, 4)
+        d_basis = torch.stack(dbasis_list, dim=-1) # shape: (R, G)
         self.register_buffer("d_basis", d_basis, persistent=False)
 
     def forward(self, control_points, weights=None, return_normals=True):
@@ -109,11 +123,14 @@ class NurbsDecoder(nn.Module):
     Given a global shape embedding, K zonal embeddings, and 3D zone anchors,
     K patch workers predict local control point grids P and rational weights W.
     """
-    def __init__(self, embed_dim=128, num_patches=32, eval_res=16):
+    def __init__(self, embed_dim=128, num_patches=32, eval_res=16, patch_degree=3):
         super().__init__()
         self.num_patches = num_patches
         self.eval_res = eval_res
-        self.evaluator = DifferentiableNurbsEvaluator(num_samples=eval_res)
+        self.patch_degree = patch_degree
+        self.grid_size = patch_degree + 1
+        G = self.grid_size
+        self.evaluator = DifferentiableNurbsEvaluator(num_samples=eval_res, degree=patch_degree)
 
         # Learnable worker query slots: (K, embed_dim)
         self.patch_queries = nn.Parameter(torch.randn(num_patches, embed_dim) * 0.02)
@@ -131,10 +148,10 @@ class NurbsDecoder(nn.Module):
         self.res2 = ResidualMLPBlock(hidden_dim)
 
         # Controller output heads:
-        # Control points: 4 x 4 x 3 = 48 values per patch
-        self.cp_head = nn.Linear(hidden_dim, 4 * 4 * 3)
-        # Rational weights: 4 x 4 = 16 values per patch (positive)
-        self.weight_head = nn.Linear(hidden_dim, 4 * 4)
+        # Control points: G x G x 3 values per patch
+        self.cp_head = nn.Linear(hidden_dim, G * G * 3)
+        # Rational weights: G x G values per patch (positive)
+        self.weight_head = nn.Linear(hidden_dim, G * G)
 
     def forward(self, shape_embedding, zonal_embeddings=None, zone_anchors=None, return_normals=True):
         """
@@ -145,12 +162,13 @@ class NurbsDecoder(nn.Module):
             return_normals: If True, evaluates analytical surface normals
         Returns:
             dict containing:
-              - 'control_points': (B, K, 4, 4, 3)
-              - 'weights': (B, K, 4, 4)
+              - 'control_points': (B, K, G, G, 3)
+              - 'weights': (B, K, G, G)
               - 'surface_points': (B, K * R * R, 3)
               - 'surface_normals' (optional): (B, K * R * R, 3)
         """
         B = shape_embedding.shape[0]
+        G = self.grid_size
 
         # Expand patch queries across batch: (B, K, embed_dim)
         queries = self.patch_queries.unsqueeze(0).expand(B, -1, -1)
@@ -168,14 +186,14 @@ class NurbsDecoder(nn.Module):
         feat = self.res2(feat)
 
         # Predict controllers
-        cp_delta = self.cp_head(feat).reshape(B, self.num_patches, 4, 4, 3)
+        cp_delta = self.cp_head(feat).reshape(B, self.num_patches, G, G, 3)
         if zone_anchors is not None:
             # Anchor patches around their physical 3D zone centers
             cp = cp_delta + zone_anchors.unsqueeze(2).unsqueeze(3)
         else:
             cp = cp_delta
 
-        w = F.softplus(self.weight_head(feat)).reshape(B, self.num_patches, 4, 4) + 0.1
+        w = F.softplus(self.weight_head(feat)).reshape(B, self.num_patches, G, G) + 0.1
 
         # Evaluate continuous parametric surfaces
         if return_normals:

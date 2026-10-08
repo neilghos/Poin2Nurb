@@ -65,7 +65,9 @@ def evaluate(model, test_loader, device, eval_res=16, max_batches=None):
     orig_res = model.decoder.eval_res
     orig_evaluator = model.decoder.evaluator
     if orig_res != eval_res:
-        model.decoder.evaluator = DifferentiableNurbsEvaluator(num_samples=eval_res).to(device)
+        model.decoder.evaluator = DifferentiableNurbsEvaluator(
+            num_samples=eval_res, degree=model.decoder.patch_degree
+        ).to(device)
         model.decoder.eval_res = eval_res
 
     total_cd = 0.0
@@ -152,6 +154,7 @@ def train(args):
         num_patches=args.num_patches,
         eval_res=args.train_eval_res,
         use_macro_gnn=args.macro_gnn,
+        patch_degree=args.patch_degree,
     ).to(device)
 
     if args.resume and os.path.exists(args.resume):
@@ -268,6 +271,7 @@ def train(args):
             save_payload = {
                 "epoch": epoch,
                 "num_patches": args.num_patches,
+                "patch_degree": args.patch_degree,
                 "eval_res": args.eval_res,
                 "embed_dim": args.embed_dim,
                 "use_macro_gnn": args.macro_gnn,
@@ -294,20 +298,21 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_pct", type=float, default=0.05, help="Warmup fraction of total steps (default 0.05 = 5% warmup)")
     parser.add_argument("--macro_gnn", action="store_true", default=True, help="Enable Tier 2 Macro GNN inter-zone message passing (default True)")
     parser.add_argument("--no_macro_gnn", dest="macro_gnn", action="store_false", help="Disable Tier 2 Macro GNN (ablation to original baseline)")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size for evaluation")
     parser.add_argument("--train_gt_points", type=int, default=2048, help="Number of GT points to sample during training (default 2048 for 4x speedup, 0 for all 8192)")
-    parser.add_argument("--embed_dim", type=int, default=128, help="Encoder embedding dimension")
+    parser.add_argument("--embed_dim", type=int, default=256, help="Encoder embedding dimension")
     parser.add_argument("--num_patches", type=int, default=32, help="Number of NURBS surface patches")
+    parser.add_argument("--patch_degree", type=int, default=5, help="Bernstein patch polynomial degree (3 for 4x4, 5 for 6x6, etc.)")
     parser.add_argument("--train_eval_res", type=int, default=12, help="Patch resolution during training (12x12=144 pts/patch)")
     parser.add_argument("--eval_res", type=int, default=16, help="Patch resolution during evaluation (16x16=256 pts/patch = 8192 pts total)")
-    parser.add_argument("--lambda_normal", type=float, default=0.1, help="Weight for analytical normal alignment loss")
+    parser.add_argument("--lambda_normal", type=float, default=0.15, help="Weight for analytical normal alignment loss")
     parser.add_argument("--num_workers", type=int, default=0, help="0 workers to prevent RAM replication")
     parser.add_argument("--log_interval", type=int, default=50, help="Log step interval")
     parser.add_argument("--test_eval_batches", type=int, default=15, help="Num test batches for validation (15*16=240 shapes)")
     parser.add_argument("--max_train_batches", type=int, default=None, help="Cap train steps per epoch for fast sanity checks")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Path to save weights")
-    parser.add_argument("--save_name", type=str, default="geomnet_best.pth", help="Checkpoint filename to save best weights")
+    parser.add_argument("--save_name", type=str, default="geomnet_k32_deg5_100e.pth", help="Checkpoint filename to save best weights")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for fine-tuning/resuming")
     parser.add_argument("--lambda_laplacian", type=float, default=0.01, help="Weight for 2D control point Laplacian stiffness")
     parser.add_argument("--topk_ratio", type=float, default=0.05, help="Top-k outlier ratio for Direction 1 Pred->GT")
