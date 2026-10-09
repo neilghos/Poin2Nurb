@@ -36,7 +36,38 @@ def seed_worker(worker_id):
     """
     worker_seed = torch.initial_seed() % (2**32)
     np.random.seed(worker_seed)
-    random.seed(worker_seed)
+
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_ratio=0.0667):
+    """
+    Cosine annealing learning rate schedule with linear warmup and non-zero minimum LR floor.
+    Ensures gradients never freeze during late epochs (e.g. 150-250+), avoiding the stagnation
+    seen with OneCycleLR whose tail drops to 1e-7.
+    """
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return min_lr_ratio + (1.0 - min_lr_ratio) * float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def update_bn_momentum(model, epoch, max_epochs, initial_momentum=0.1, min_momentum=0.01):
+    """
+    Decays BatchNorm momentum smoothly across training.
+    Literature standard (DGCNN / PointNet++ / PaCo / AdaPoinTr):
+    High momentum (0.1) early on rapidly tracks initial statistics; low momentum (0.01) late in
+    training prevents noise in running mean/variance from destabilizing geometric coordinate convergence.
+    """
+    progress = float(epoch - 1) / float(max(1, max_epochs - 1))
+    progress = min(max(progress, 0.0), 1.0)
+    mom = min_momentum + 0.5 * (initial_momentum - min_momentum) * (1.0 + math.cos(math.pi * progress))
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            m.momentum = mom
+    return mom
 
 
 class CUDAPrefetcher:
@@ -203,24 +234,29 @@ def train(args):
     ).to(device)
 
     if args.resume and os.path.exists(args.resume):
-        print(f"\n--> Loading checkpoint from {args.resume} for fine-tuning...")
+        print(f"\n--> Loading checkpoint from {args.resume}...")
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model_state"])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = args.max_train_batches if args.max_train_batches is not None else len(train_loader)
     total_steps = args.epochs * steps_per_epoch
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    warmup_steps = args.warmup_epochs * steps_per_epoch
+    min_lr_ratio = max(args.min_lr / args.lr, 1e-6)
+
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        max_lr=args.lr,
+        warmup_steps=warmup_steps,
         total_steps=total_steps,
-        pct_start=args.warmup_pct,
-        anneal_strategy="cos",
-        div_factor=10.0,
-        final_div_factor=100.0,
+        min_lr_ratio=min_lr_ratio,
     )
-    sched_desc = f"OneCycleLR (peak LR={args.lr:.4f}, warmup {args.warmup_pct*100:.1f}%, total steps={total_steps})"
+    sched_desc = (
+        f"CosineWarmup (peak LR={args.lr:.6f}, min LR floor={args.min_lr:.6f}, "
+        f"warmup {args.warmup_epochs} eps ({warmup_steps} steps), total steps={total_steps})"
+    )
 
     print(f"Scheduler       : {sched_desc}")
+    print(f"BN Momentum     : {'Cosine decay (0.1 -> 0.01)' if args.bn_decay else 'Static (0.1)'}")
+    print(f"Weight Decay    : {args.weight_decay}")
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # 3. Initial Baseline Evaluation on Validation Set
@@ -236,8 +272,11 @@ def train(args):
 
     cuda_gen = torch.Generator(device=device).manual_seed(args.seed)
 
-    # 4. Training Loop
     for epoch in range(1, args.epochs + 1):
+        if args.bn_decay:
+            current_bn_mom = update_bn_momentum(model, epoch, args.epochs)
+        else:
+            current_bn_mom = 0.1
         model.train()
         train_loss = 0.0
         train_cd_total = 0.0
@@ -313,27 +352,35 @@ def train(args):
             model, val_loader, device, eval_res=args.eval_res, max_batches=args.val_eval_batches
         )
 
+        save_payload = {
+            "epoch": epoch,
+            "seed": args.seed,
+            "num_patches": args.num_patches,
+            "patch_degree": args.patch_degree,
+            "eval_res": args.eval_res,
+            "embed_dim": args.embed_dim,
+            "use_macro_gnn": args.macro_gnn,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "val_cd_x100": val_cd_x100,
+            "val_nc": val_nc,
+        }
+        # Crash resilience: persist latest checkpoint
+        torch.save(save_payload, os.path.join(args.checkpoint_dir, "checkpoint_latest.pth"))
+
+        # Periodic checkpoint
+        if args.save_freq > 0 and epoch % args.save_freq == 0:
+            torch.save(save_payload, os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch}.pth"))
+
         is_best = val_cd_x100 < best_val_cd
         if is_best:
             best_val_cd = val_cd_x100
             best_epoch = epoch
-            save_payload = {
-                "epoch": epoch,
-                "seed": args.seed,
-                "num_patches": args.num_patches,
-                "patch_degree": args.patch_degree,
-                "eval_res": args.eval_res,
-                "embed_dim": args.embed_dim,
-                "use_macro_gnn": args.macro_gnn,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "val_cd_x100": val_cd_x100,
-                "val_nc": val_nc,
-            }
             torch.save(save_payload, os.path.join(args.checkpoint_dir, args.save_name))
 
         star = " (*)" if is_best else ""
-        print(f"\n>>> Epoch {epoch:2d}/{args.epochs:2d} Summary [{epoch_dur:.1f}s | LR: {current_lr:.6f}]:")
+        print(f"\n>>> Epoch {epoch:2d}/{args.epochs:2d} Summary [{epoch_dur:.1f}s | LR: {current_lr:.6f} | BN Mom: {current_bn_mom:.3f}]:")
         print(f"    Train CD x 100 : {avg_train_cd:.2f} | Train NC: {avg_train_nc:.4f}")
         print(f"    Val   CD x 100 : {val_cd_x100:.2f} | Val   NC: {val_nc:.4f} (evaluated on {n_eval} val shapes){star}")
         print(f"    Best  Val CD   : {best_val_cd:.2f} (Epoch {best_epoch}) | Definitive SOTA Ref: ~1.6 - 1.8 / NC: 0.950\n")
@@ -361,9 +408,13 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train and Evaluate GeomNet on ABC Benchmark")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for total end-to-end determinism")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs (default 100)")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate for OneCycleLR")
-    parser.add_argument("--warmup_pct", type=float, default=0.05, help="Warmup fraction of total steps (default 0.05 = 5% warmup)")
+    parser.add_argument("--epochs", type=int, default=250, help="Number of epochs (default 250)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate for Cosine schedule (default 3e-4)")
+    parser.add_argument("--min_lr", type=float, default=2e-5, help="Minimum learning rate floor (default 2e-5)")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of linear warmup epochs (default 5)")
+    parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay for AdamW (default 5e-4)")
+    parser.add_argument("--bn_decay", action="store_true", default=True, help="Decay BatchNorm momentum from 0.1 to 0.01")
+    parser.add_argument("--no_bn_decay", dest="bn_decay", action="store_false", help="Disable BatchNorm momentum decay")
     parser.add_argument("--macro_gnn", action="store_true", default=True, help="Enable Tier 2 Macro GNN inter-zone message passing (default True)")
     parser.add_argument("--no_macro_gnn", dest="macro_gnn", action="store_false", help="Disable Tier 2 Macro GNN (ablation to original baseline)")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
@@ -380,7 +431,8 @@ if __name__ == "__main__":
     parser.add_argument("--val_eval_batches", type=int, default=None, help="Num val batches per epoch (default None = all 1000 val shapes, or e.g. 15 for 240 shapes)")
     parser.add_argument("--max_train_batches", type=int, default=None, help="Cap train steps per epoch for fast sanity checks")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Path to save weights")
-    parser.add_argument("--save_name", type=str, default="geomnet_k32_deg5_100e.pth", help="Checkpoint filename to save best weights")
+    parser.add_argument("--save_name", type=str, default="geomnet_256_250e.pth", help="Checkpoint filename to save best weights")
+    parser.add_argument("--save_freq", type=int, default=50, help="Periodic checkpoint save frequency in epochs (default 50)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for fine-tuning/resuming")
     parser.add_argument("--lambda_laplacian", type=float, default=0.01, help="Weight for 2D control point Laplacian stiffness")
     parser.add_argument("--topk_ratio", type=float, default=0.05, help="Top-k outlier ratio for Direction 1 Pred->GT")
