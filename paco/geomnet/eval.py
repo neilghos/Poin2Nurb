@@ -164,7 +164,9 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
         model.load_state_dict(ckpt["model_state"])
         gnn_str = "with Macro GNN" if use_gnn else "without Macro GNN"
         deg_str = f"{deg+1}x{deg+1} (degree {deg})"
-        print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (K={k_patches} patches, {deg_str}, {gnn_str}, Test CD x 100: {ckpt.get('test_cd_x100', '?'):.2f})")
+        cd_val = ckpt.get("val_cd_x100", ckpt.get("test_cd_x100", None))
+        cd_str = f"CD x 100: {cd_val:.2f}" if isinstance(cd_val, (int, float)) else "CD: ?"
+        print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (K={k_patches} patches, {deg_str}, {gnn_str}, {cd_str})")
     else:
         k_patches = 32
         deg = 5

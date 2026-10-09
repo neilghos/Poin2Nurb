@@ -5,11 +5,59 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
+def ensure_train_val_splits(data_root, val_count=1000, seed=42):
+    """
+    Deterministically creates non-overlapping train_clean.txt and val.txt from train.txt.
+    Guarantees:
+      - train_clean INTERSECT val = EMPTY SET
+      - val INTERSECT test = EMPTY SET
+    """
+    train_clean_file = os.path.join(data_root, "train_clean.txt")
+    val_file = os.path.join(data_root, "val.txt")
+
+    if os.path.exists(train_clean_file) and os.path.exists(val_file):
+        return train_clean_file, val_file
+
+    train_file = os.path.join(data_root, "train.txt")
+    if not os.path.exists(train_file):
+        raise FileNotFoundError(f"Source train file not found at {train_file}")
+
+    with open(train_file, "r") as f:
+        all_train = [line.strip() for line in f if line.strip()]
+
+    rng = random.Random(seed)
+    shuffled = list(all_train)
+    rng.shuffle(shuffled)
+
+    n_val = min(val_count, len(all_train))
+    val_items = sorted(shuffled[:n_val])
+    train_items = sorted(shuffled[n_val:])
+
+    with open(val_file, "w") as f:
+        f.write("\n".join(val_items) + "\n")
+
+    with open(train_clean_file, "w") as f:
+        f.write("\n".join(train_items) + "\n")
+
+    # Leakage check: verify disjoint sets
+    assert len(set(val_items).intersection(set(train_items))) == 0, "Data leakage: train and val overlap!"
+
+    test_file = os.path.join(data_root, "test.txt")
+    if os.path.exists(test_file):
+        with open(test_file, "r") as f:
+            test_items = set(line.strip() for line in f if line.strip())
+        assert len(set(val_items).intersection(test_items)) == 0, "Data leakage: val and test overlap!"
+
+    print(f"Created leak-free splits: {len(train_items)} train shapes, {len(val_items)} val shapes (seed {seed})")
+    return train_clean_file, val_file
+
+
 class ABCDataset(Dataset):
     """
     Direct HDF5 ABC Benchmark Dataset matching PaCo's protocol.
+    Supports leak-free 'train', 'val', 'train_full', and 'test' splits.
     """
-    def __init__(self, data_root=None, split="train"):
+    def __init__(self, data_root=None, split="train", val_count=1000, seed=42):
         if data_root is None or not os.path.exists(data_root):
             # Check relative to this script or current working directory
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,13 +72,20 @@ class ABCDataset(Dataset):
 
         self.data_root = data_root
         self.split = split
-        split_file = os.path.join(data_root, f"{split}.txt")
-        
+
+        if split in ["train", "val"]:
+            train_clean_file, val_file = ensure_train_val_splits(data_root, val_count=val_count, seed=seed)
+            split_file = train_clean_file if split == "train" else val_file
+        elif split == "train_full":
+            split_file = os.path.join(data_root, "train.txt")
+        else:
+            split_file = os.path.join(data_root, f"{split}.txt")
+
         with open(split_file, "r") as f:
             self.model_ids = [line.strip().replace(".npy", "") for line in f if line.strip()]
 
-        # 24 renderings for train, 1 fixed rendering for test (PaCo standard)
-        self.num_renderings = 24 if split == "train" else 1
+        # 24 camera viewpoints for train; fixed canonical view 0 for val and test
+        self.num_renderings = 24 if split in ["train", "train_full"] else 1
         
         # Lazy file handles for safe multi-worker DataLoader support
         self.pc_file = None
@@ -48,8 +103,8 @@ class ABCDataset(Dataset):
         self._open_h5()
         model_id = self.model_ids[idx]
 
-        # Random camera viewpoint for train; view 0 for test
-        render_idx = random.randint(0, self.num_renderings - 1) if self.split == "train" else 0
+        # Random camera viewpoint for multi-view train; view 0 for val and test
+        render_idx = random.randint(0, self.num_renderings - 1) if self.num_renderings > 1 else 0
         pc_key = f"{model_id}_{render_idx:02d}"
 
         # Incomplete scan: shape (2048, 3)
