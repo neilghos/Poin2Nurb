@@ -270,10 +270,12 @@ def chamfer_and_normal_loss(
     lambda_laplacian=0.01,
     topk_ratio=0.05,
     lambda_topk=0.5,
+    topk_ratio_cov=None,
+    lambda_topk_cov=None,
 ):
     """
-    Joint Chamfer Distance, Top-k Outlier Loss, Analytical Normal Alignment,
-    and 2D Control Grid Laplacian Regularizer.
+    Joint Chamfer Distance, Symmetric Top-k Precision & Coverage Outlier Loss,
+    Analytical Normal Alignment, and 2D Control Grid Laplacian Regularizer.
     
     Args:
         p_pred: Predicted surface points (B, N, 3)
@@ -281,16 +283,18 @@ def chamfer_and_normal_loss(
         p_gt: Ground truth surface points (B, M, 3)
         n_gt: Ground truth surface normals (B, M, 3)
         lambda_normal: Weight for symmetric normal alignment loss
-        cp: Control points (B, K, 4, 4, 3) for Laplacian stiffness regularization
+        cp: Control points (B, K, G, G, 3) for Laplacian stiffness regularization
         lambda_laplacian: Weight for 2D control point Laplacian penalty
-        topk_ratio: Fraction of worst outlier points to penalize in Direction 1 (Pred->GT)
-        lambda_topk: Weight for top-k outlier penalty
+        topk_ratio: Fraction of worst outlier points in Direction 1 (Pred->GT: precision)
+        lambda_topk: Weight for Direction 1 top-k precision penalty (crushes stray whiskers)
+        topk_ratio_cov: Fraction of worst uncovered points in Direction 2 (GT->Pred: recall)
+        lambda_topk_cov: Weight for Direction 2 top-k coverage penalty (forces wings/crossbars)
     Returns:
         total_loss, cd_mean, normal_loss, nc_metric
     """
     dists = torch.cdist(p_pred, p_gt)  # (B, N, M)
-    min_d1, idx1 = dists.min(dim=2)    # (B, N) - Pred -> GT
-    min_d2, idx2 = dists.min(dim=1)    # (B, M) - GT -> Pred
+    min_d1, idx1 = dists.min(dim=2)    # (B, N) - Pred -> GT (Precision)
+    min_d2, idx2 = dists.min(dim=1)    # (B, M) - GT -> Pred (Recall / Coverage)
 
     cd_mean = min_d1.mean() + min_d2.mean()
 
@@ -309,11 +313,19 @@ def chamfer_and_normal_loss(
 
     total_loss = cd_mean + lambda_normal * normal_loss
 
-    # Top-k hard outlier penalty on Direction 1 (Pred -> GT) to crush boundary whiskers
+    # Direction 1: Top-k hard outlier penalty (Pred -> GT) to crush boundary whiskers & stray points
     if topk_ratio > 0.0 and lambda_topk > 0.0:
-        k = max(1, int(topk_ratio * min_d1.shape[1]))
-        topk_d1 = torch.topk(min_d1, k=k, dim=1)[0].mean()
+        k1 = max(1, int(topk_ratio * min_d1.shape[1]))
+        topk_d1 = torch.topk(min_d1, k=k1, dim=1)[0].mean()
         total_loss = total_loss + lambda_topk * topk_d1
+
+    # Direction 2: Top-k hard coverage penalty (GT -> Pred) to force completion of unobserved CAD wings/crossbars
+    effective_cov_ratio = topk_ratio_cov if topk_ratio_cov is not None else topk_ratio
+    effective_cov_weight = lambda_topk_cov if lambda_topk_cov is not None else lambda_topk
+    if effective_cov_ratio > 0.0 and effective_cov_weight > 0.0:
+        k2 = max(1, int(effective_cov_ratio * min_d2.shape[1]))
+        topk_d2 = torch.topk(min_d2, k=k2, dim=1)[0].mean()
+        total_loss = total_loss + effective_cov_weight * topk_d2
 
     # 2D Control grid Laplacian stiffness to kill pillowing
     if cp is not None and lambda_laplacian > 0.0:

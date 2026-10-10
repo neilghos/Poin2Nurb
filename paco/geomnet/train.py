@@ -182,7 +182,7 @@ def train(args):
     print(f"Learning Rate   : {args.lr}")
     print(f"Num Patches     : {args.num_patches} (train res {args.train_eval_res}x{args.train_eval_res}, test res {args.eval_res}x{args.eval_res})")
     print(f"Train Pred Pts  : {args.num_patches * args.train_eval_res * args.train_eval_res} per shape")
-    print(f"Regularization  : Top-k (k={args.topk_ratio}, weight={args.lambda_topk}) + Laplacian (weight={args.lambda_laplacian})")
+    print(f"Regularization  : Top-k Precision (k={args.topk_ratio}, w={args.lambda_topk}) + Top-k Coverage (k={args.topk_ratio_cov}, w={args.lambda_topk_cov}) + Laplacian (w={args.lambda_laplacian})")
     print(f"Lambda Normal   : {args.lambda_normal}")
     print(f"Macro GNN       : {'Enabled (Tier 2 inter-zone coordination)' if args.macro_gnn else 'Disabled (original baseline)'}")
     print(f"Epochs          : {args.epochs}")
@@ -315,6 +315,8 @@ def train(args):
                 lambda_laplacian=args.lambda_laplacian,
                 topk_ratio=args.topk_ratio,
                 lambda_topk=args.lambda_topk,
+                topk_ratio_cov=args.topk_ratio_cov,
+                lambda_topk_cov=args.lambda_topk_cov,
             )
             total_loss.backward()
 
@@ -435,8 +437,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_freq", type=int, default=50, help="Periodic checkpoint save frequency in epochs (default 50)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint for fine-tuning/resuming")
     parser.add_argument("--lambda_laplacian", type=float, default=0.01, help="Weight for 2D control point Laplacian stiffness")
-    parser.add_argument("--topk_ratio", type=float, default=0.05, help="Top-k outlier ratio for Direction 1 Pred->GT")
-    parser.add_argument("--lambda_topk", type=float, default=0.5, help="Weight for top-k outlier penalty")
+    parser.add_argument("--topk_ratio", type=float, default=0.05, help="Top-k outlier ratio for Direction 1 Pred->GT (default 0.05)")
+    parser.add_argument("--lambda_topk", type=float, default=0.5, help="Weight for Direction 1 top-k precision penalty (default 0.5)")
+    parser.add_argument("--topk_ratio_cov", type=float, default=0.05, help="Top-k coverage outlier ratio for Direction 2 GT->Pred (default 0.05)")
+    parser.add_argument("--lambda_topk_cov", type=float, default=0.5, help="Weight for Direction 2 top-k coverage penalty (default 0.5)")
 
     args = parser.parse_args()
     train(args)
