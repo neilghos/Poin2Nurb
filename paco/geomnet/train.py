@@ -121,12 +121,8 @@ def evaluate(model, loader, device, eval_res=16, max_batches=None):
     """
     model.eval()
     orig_res = model.decoder.eval_res
-    orig_evaluator = model.decoder.evaluator
     if orig_res != eval_res:
-        model.decoder.evaluator = DifferentiableNurbsEvaluator(
-            num_samples=eval_res, degree=model.decoder.patch_degree
-        ).to(device)
-        model.decoder.eval_res = eval_res
+        model.decoder.set_eval_res(eval_res)
 
     total_cd = 0.0
     total_nc = 0.0
@@ -160,8 +156,8 @@ def evaluate(model, loader, device, eval_res=16, max_batches=None):
             total_samples += batch_sz
 
     # Restore training evaluator
-    model.decoder.evaluator = orig_evaluator
-    model.decoder.eval_res = orig_res
+    if orig_res != eval_res:
+        model.decoder.set_eval_res(orig_res)
 
     mean_cd = total_cd / max(total_samples, 1)
     cd_x100 = mean_cd * 100.0
@@ -181,6 +177,7 @@ def train(args):
     print(f"Train GT Points : {args.train_gt_points if args.train_gt_points > 0 else 'Full (8192)'} (stochastic sampling)")
     print(f"Learning Rate   : {args.lr}")
     print(f"Num Patches     : {args.num_patches} (train res {args.train_eval_res}x{args.train_eval_res}, test res {args.eval_res}x{args.eval_res})")
+    print(f"Decoder Type    : {'Hierarchical Multi-Degree (4x4 + 5x5 + 6x6)' if args.multi_degree else f'Single-Degree {args.patch_degree+1}x{args.patch_degree+1}'}")
     print(f"Train Pred Pts  : {args.num_patches * args.train_eval_res * args.train_eval_res} per shape")
     print(f"Regularization  : Top-k Precision (k={args.topk_ratio}, w={args.lambda_topk}) + Top-k Coverage (k={args.topk_ratio_cov}, w={args.lambda_topk_cov}) + Laplacian (w={args.lambda_laplacian})")
     print(f"Lambda Normal   : {args.lambda_normal}")
@@ -231,6 +228,7 @@ def train(args):
         eval_res=args.train_eval_res,
         use_macro_gnn=args.macro_gnn,
         patch_degree=args.patch_degree,
+        multi_degree=args.multi_degree,
     ).to(device)
 
     if args.resume and os.path.exists(args.resume):
@@ -305,13 +303,18 @@ def train(args):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = model(pc, return_normals=True)
 
+            cp_arg = (
+                [p.float() for p in out["control_points"]]
+                if isinstance(out["control_points"], (list, tuple))
+                else out["control_points"].float()
+            )
             total_loss, cd_loss, normal_loss, nc = chamfer_and_normal_loss(
                 out["surface_points"].float(),
                 out["surface_normals"].float(),
                 gt_train,
                 gt_normals_train,
                 lambda_normal=args.lambda_normal,
-                cp=out["control_points"].float(),
+                cp=cp_arg,
                 lambda_laplacian=args.lambda_laplacian,
                 topk_ratio=args.topk_ratio,
                 lambda_topk=args.lambda_topk,
@@ -359,6 +362,7 @@ def train(args):
             "seed": args.seed,
             "num_patches": args.num_patches,
             "patch_degree": args.patch_degree,
+            "multi_degree": args.multi_degree,
             "eval_res": args.eval_res,
             "embed_dim": args.embed_dim,
             "use_macro_gnn": args.macro_gnn,
@@ -422,12 +426,14 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size for evaluation")
     parser.add_argument("--train_gt_points", type=int, default=2048, help="Number of GT points to sample during training (default 2048 for 4x speedup, 0 for all 8192)")
+    parser.add_argument("--multi_degree", action="store_true", default=True, help="Enable Hierarchical Multi-Degree Bernstein Decoder 4x4 + 5x5 + 6x6 (default True)")
+    parser.add_argument("--no_multi_degree", dest="multi_degree", action="store_false", help="Disable Multi-Degree (single-degree patch decoder)")
     parser.add_argument("--embed_dim", type=int, default=256, help="Encoder embedding dimension")
     parser.add_argument("--num_patches", type=int, default=32, help="Number of NURBS surface patches")
     parser.add_argument("--patch_degree", type=int, default=5, help="Bernstein patch polynomial degree (3 for 4x4, 5 for 6x6, etc.)")
     parser.add_argument("--train_eval_res", type=int, default=12, help="Patch resolution during training (12x12=144 pts/patch)")
     parser.add_argument("--eval_res", type=int, default=16, help="Patch resolution during evaluation (16x16=256 pts/patch = 8192 pts total)")
-    parser.add_argument("--lambda_normal", type=float, default=0.15, help="Weight for analytical normal alignment loss")
+    parser.add_argument("--lambda_normal", type=float, default=0.30, help="Weight for analytical normal alignment loss (default 0.30)")
     parser.add_argument("--num_workers", type=int, default=0, help="0 workers to prevent RAM replication")
     parser.add_argument("--log_interval", type=int, default=50, help="Log step interval")
     parser.add_argument("--val_eval_batches", type=int, default=None, help="Num val batches per epoch (default None = all 1000 val shapes, or e.g. 15 for 240 shapes)")

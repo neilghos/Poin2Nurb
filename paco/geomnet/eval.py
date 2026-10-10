@@ -150,36 +150,38 @@ def run_evaluation(checkpoint_path="checkpoints/geomnet_best.pth", num_test_samp
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device)
         k_patches = ckpt.get("num_patches", 32)
-        deg = ckpt.get("patch_degree", 3)
+        deg = ckpt.get("patch_degree", 5)
         r_eval = ckpt.get("eval_res", 16)
-        e_dim = ckpt.get("embed_dim", 192)
+        e_dim = ckpt.get("embed_dim", 256)
         use_gnn = ckpt.get("use_macro_gnn", any("macro_gnn" in k for k in ckpt.get("model_state", {}).keys()))
+        is_multi_degree = ckpt.get(
+            "multi_degree",
+            any("cp_head_3" in k or "evaluators.deg_3" in k for k in ckpt.get("model_state", {}).keys())
+        )
         model = GeomNet(
             embed_dim=e_dim,
             num_patches=k_patches,
             eval_res=r_eval,
             use_macro_gnn=use_gnn,
             patch_degree=deg,
+            multi_degree=is_multi_degree,
         ).to(device)
         model.load_state_dict(ckpt["model_state"])
         gnn_str = "with Macro GNN" if use_gnn else "without Macro GNN"
-        deg_str = f"{deg+1}x{deg+1} (degree {deg})"
+        deg_str = "Hierarchical Multi-Degree (4x4+5x5+6x6)" if is_multi_degree else f"{deg+1}x{deg+1} (degree {deg})"
         cd_val = ckpt.get("val_cd_x100", ckpt.get("test_cd_x100", None))
         cd_str = f"CD x 100: {cd_val:.2f}" if isinstance(cd_val, (int, float)) else "CD: ?"
         print(f"Loaded weights from epoch {ckpt.get('epoch', '?')} (K={k_patches} patches, {deg_str}, {gnn_str}, {cd_str})")
     else:
         k_patches = 32
         deg = 5
-        model = GeomNet(embed_dim=192, num_patches=32, eval_res=16, use_macro_gnn=True, patch_degree=deg).to(device)
+        model = GeomNet(embed_dim=256, num_patches=32, eval_res=16, use_macro_gnn=True, patch_degree=deg, multi_degree=True).to(device)
         print("Warning: Checkpoint not found, evaluating untrained initialization.")
 
     # If evaluating fixed number of points (e.g. 10,000), adjust decoder grid resolution dynamically
     if eval_points:
         req_res = int(np.ceil(np.sqrt(eval_points / k_patches)))
-        model.decoder.eval_res = req_res
-        model.decoder.evaluator = DifferentiableNurbsEvaluator(
-            num_samples=req_res, degree=model.decoder.patch_degree
-        ).to(device)
+        model.decoder.set_eval_res(req_res)
 
     model.eval()
 

@@ -27,10 +27,12 @@ class GeomNet(nn.Module):
         use_macro_gnn=True,
         k_neighbors=6,
         gnn_layers=2,
-        patch_degree=3,
+        patch_degree=5,
+        multi_degree=True,
     ):
         super().__init__()
         self.patch_degree = patch_degree
+        self.multi_degree = multi_degree
         self.use_macro_gnn = use_macro_gnn
         self.encoder = HierarchicalPointEncoder(in_channels=3, out_dim=embed_dim, num_patches=num_patches)
         if use_macro_gnn:
@@ -42,6 +44,7 @@ class GeomNet(nn.Module):
             num_patches=num_patches,
             eval_res=eval_res,
             patch_degree=patch_degree,
+            multi_degree=multi_degree,
         )
 
     def forward(self, pc, return_normals=True):
