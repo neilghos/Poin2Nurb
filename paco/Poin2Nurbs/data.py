@@ -58,8 +58,13 @@ class ABCDataset(Dataset):
     Direct HDF5 ABC Benchmark Dataset matching PaCo's protocol.
     Supports leak-free 'train', 'val', 'train_full', and 'test' splits.
     """
-    def __init__(self, data_root=None, split="train", val_count=1000, seed=42):
-        if data_root is None or not os.path.exists(data_root):
+    def __init__(self, data_root=None, split="train", val_count=1000, seed=42,
+                 mode="mixed", match_paco_input=False):
+        if mode not in ("mixed", "easy", "medium", "hard"):
+            raise ValueError(f"Unknown ABC input mode: {mode}")
+        if mode != "mixed" and split != "test":
+            raise ValueError("Easy, medium, and hard inputs are test-only")
+        if data_root is None:
             # Check relative to this script or current working directory
             script_dir = os.path.dirname(os.path.abspath(__file__))
             candidates = [
@@ -67,15 +72,18 @@ class ABCDataset(Dataset):
                 os.path.abspath(os.path.join(script_dir, "../../abc")),
                 os.path.abspath(os.path.join(script_dir, "../abc")),
                 os.path.abspath("abc"),
-                "/data/Nurbs Geometric Nueral Net with self training data generation/abc",
                 os.path.abspath(os.path.join(script_dir, "../../data/abc")),
                 os.path.abspath(os.path.join(script_dir, "../data/abc")),
                 os.path.abspath("data/abc"),
             ]
             data_root = next((c for c in candidates if c and os.path.exists(c)), "abc")
+        if not os.path.isdir(data_root):
+            raise FileNotFoundError(f"ABC data root not found: {data_root}")
 
         self.data_root = data_root
         self.split = split
+        self.mode = mode
+        self.match_paco_input = match_paco_input
 
         if split in ["train", "val"]:
             train_clean_file, val_file = ensure_train_val_splits(data_root, val_count=val_count, seed=seed)
@@ -92,8 +100,10 @@ class ABCDataset(Dataset):
         self.num_renderings = 24 if split in ["train", "train_full"] else 1
         
         # Check whether data is stored as unified H5 or individual NPY files
-        self.use_h5 = os.path.exists(os.path.join(self.data_root, "gt_all.h5"))
-        self.pc_dir = os.path.join(self.data_root, "pc")
+        self.use_h5 = mode == "mixed" and os.path.exists(os.path.join(self.data_root, "gt_all.h5"))
+        if self.use_h5 and match_paco_input:
+            raise ValueError("PaCo input preprocessing requires the original NPY scans")
+        self.pc_dir = os.path.join(self.data_root, "pc" if mode == "mixed" else f"eval/pc_{mode}")
         self.gt_dir = os.path.join(self.data_root, "gt")
 
         # Lazy file handles for H5 if used
@@ -127,8 +137,25 @@ class ABCDataset(Dataset):
             pts = pc_raw[:, :3]
             n_pts = pts.shape[0]
 
-            # Upsample / downsample to exactly 2048 points matching PaCo
-            if n_pts >= 2048:
+            # The benchmark path reproduces PaCo's UpSamplePoints indexing on XYZ.
+            if self.match_paco_input:
+                rng = np.random if self.split in ["train", "train_full"] else np.random.RandomState(idx)
+                if self.split not in ["train", "train_full"]:
+                    # PaCo's Compose consumes one uniform draw before each
+                    # transform (UpSamplePlanes, then UpSamplePoints). Keep
+                    # those draws so the subsequent permutation is identical.
+                    rng.uniform(0, 1)
+                    rng.uniform(0, 1)
+                need = 2048 - n_pts
+                if need < 0:
+                    pts = pts[rng.permutation(2048)]
+                else:
+                    while n_pts <= need:
+                        pts = np.tile(pts, (2, 1))
+                        need -= n_pts
+                        n_pts *= 2
+                    pts = np.concatenate((pts, pts[rng.permutation(need)]), axis=0)
+            elif n_pts >= 2048:
                 if self.split in ["train", "train_full"]:
                     choice = np.random.choice(n_pts, 2048, replace=False)
                 else:
