@@ -1,5 +1,6 @@
 import os
 import random
+import numpy as np
 import h5py
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -63,12 +64,15 @@ class ABCDataset(Dataset):
             script_dir = os.path.dirname(os.path.abspath(__file__))
             candidates = [
                 data_root,
+                os.path.abspath(os.path.join(script_dir, "../../abc")),
+                os.path.abspath(os.path.join(script_dir, "../abc")),
+                os.path.abspath("abc"),
+                "/data/Nurbs Geometric Nueral Net with self training data generation/abc",
                 os.path.abspath(os.path.join(script_dir, "../../data/abc")),
                 os.path.abspath(os.path.join(script_dir, "../data/abc")),
                 os.path.abspath("data/abc"),
-                "/data/Nurbs Geometric Nueral Net with self training data generation/data/abc",
             ]
-            data_root = next((c for c in candidates if c and os.path.exists(c)), "data/abc")
+            data_root = next((c for c in candidates if c and os.path.exists(c)), "abc")
 
         self.data_root = data_root
         self.split = split
@@ -87,7 +91,12 @@ class ABCDataset(Dataset):
         # 24 camera viewpoints for train; fixed canonical view 0 for val and test
         self.num_renderings = 24 if split in ["train", "train_full"] else 1
         
-        # Lazy file handles for safe multi-worker DataLoader support
+        # Check whether data is stored as unified H5 or individual NPY files
+        self.use_h5 = os.path.exists(os.path.join(self.data_root, "gt_all.h5"))
+        self.pc_dir = os.path.join(self.data_root, "pc")
+        self.gt_dir = os.path.join(self.data_root, "gt")
+
+        # Lazy file handles for H5 if used
         self.pc_file = None
         self.gt_file = None
 
@@ -100,19 +109,47 @@ class ABCDataset(Dataset):
         return len(self.model_ids)
 
     def __getitem__(self, idx):
-        self._open_h5()
         model_id = self.model_ids[idx]
 
         # Random camera viewpoint for multi-view train; view 0 for val and test
         render_idx = random.randint(0, self.num_renderings - 1) if self.num_renderings > 1 else 0
-        pc_key = f"{model_id}_{render_idx:02d}"
 
-        # Incomplete scan: shape (2048, 3)
-        pc = torch.from_numpy(self.pc_file[pc_key][:]).float()
+        if self.use_h5:
+            self._open_h5()
+            pc_key = f"{model_id}_{render_idx:02d}"
+            pc = torch.from_numpy(self.pc_file[pc_key][:]).float()
+            gt_raw = torch.from_numpy(self.gt_file[model_id][:]).float()
+            gt_xyz = gt_raw[:, :3]
+            gt_normals = gt_raw[:, 3:6]
+        else:
+            pc_path = os.path.join(self.pc_dir, f"{model_id}_{render_idx:02d}.npy")
+            pc_raw = np.load(pc_path)
+            pts = pc_raw[:, :3]
+            n_pts = pts.shape[0]
 
-        gt_raw = torch.from_numpy(self.gt_file[model_id][:]).float()
-        gt_xyz = gt_raw[:, :3]
-        gt_normals = gt_raw[:, 3:6]
+            # Upsample / downsample to exactly 2048 points matching PaCo
+            if n_pts >= 2048:
+                if self.split in ["train", "train_full"]:
+                    choice = np.random.choice(n_pts, 2048, replace=False)
+                else:
+                    rng = np.random.RandomState(idx)
+                    choice = rng.choice(n_pts, 2048, replace=False)
+                pts = pts[choice]
+            else:
+                need = 2048 - n_pts
+                if self.split in ["train", "train_full"]:
+                    choice = np.random.choice(n_pts, need, replace=True)
+                else:
+                    rng = np.random.RandomState(idx)
+                    choice = rng.choice(n_pts, need, replace=True)
+                pts = np.concatenate([pts, pts[choice]], axis=0)
+
+            pc = torch.from_numpy(pts).float()
+
+            gt_path = os.path.join(self.gt_dir, f"{model_id}.npy")
+            gt_raw = np.load(gt_path)
+            gt_xyz = torch.from_numpy(gt_raw[:, :3]).float()
+            gt_normals = torch.from_numpy(gt_raw[:, 3:6]).float()
 
         return {
             "model_id": model_id,
