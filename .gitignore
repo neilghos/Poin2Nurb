@@ -4,6 +4,7 @@ data/
 *.hdf5
 *.zip
 *.tar*
+*.npy*
 
 # PyTorch checkpoints and model weights
 *.pth
@@ -30,3 +31,5 @@ visualizations/*.html
 .cache/
 .vscode/
 .idea/
+
+/abc
