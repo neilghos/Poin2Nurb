@@ -189,6 +189,7 @@ def run_evaluation(
     num_workers=1,
     num_viz=0,
     score_existing=False,
+    overwrite=False,
 ):
     """
     Evaluates GeomNet meshes using PaCo's mesh metric implementation:
@@ -305,7 +306,15 @@ def run_evaluation(
     # 2. Reconstruct OBJ Meshes from GeomNet
     os.makedirs(recon_dir, exist_ok=True)
     if any(name.endswith(".obj") for name in os.listdir(recon_dir)):
-        raise FileExistsError(f"Reconstruction directory contains old OBJ files: {recon_dir}")
+        if overwrite:
+            for f in os.listdir(recon_dir):
+                if f.endswith(".obj") or f.endswith(".txt"):
+                    try:
+                        os.remove(os.path.join(recon_dir, f))
+                    except OSError:
+                        pass
+        else:
+            raise FileExistsError(f"Reconstruction directory contains old OBJ files: {recon_dir}. Pass --overwrite to regenerate them, or choose a new --output_root.")
     os.makedirs(os.path.dirname(os.path.abspath(csv_report)), exist_ok=True)
 
     test_dataset = ABCDataset(data_root=data_root, split="test", mode=mode,
@@ -386,6 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--viz", type=int, default=0, help="Number of interactive 3D visualizations to save")
     parser.add_argument("--patch_res", type=int, default=16, help="Grid resolution per patch for triangulation (default: 16)")
     parser.add_argument("--points", type=int, default=10000, help="Points sampled per mesh (default: 10,000 for CVPR Table 1)")
+    parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite existing reconstructed OBJ files")
     parser.add_argument("--score-existing", action="store_true",
                         help="Score existing OBJ files in --recon_dir without rerunning inference")
     args = parser.parse_args()
@@ -403,6 +413,7 @@ if __name__ == "__main__":
             num_workers=args.workers,
         num_viz=args.viz,
         score_existing=args.score_existing,
+        overwrite=args.overwrite,
         )
     else:
         if args.recon_dir is not None or args.csv_out is not None:
@@ -422,6 +433,7 @@ if __name__ == "__main__":
                 num_workers=args.workers,
                 num_viz=args.viz,
                 score_existing=args.score_existing,
+            overwrite=args.overwrite,
             )
         aggregate = {
             "cd_x100": float(np.mean([mode_results[m]["mean_cd_x100"] for m in mode_results])),
