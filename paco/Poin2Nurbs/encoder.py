@@ -4,6 +4,58 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class GlobalPointTransformerBlock(nn.Module):
+    """
+    Global Multi-Head Self-Attention over 3D Point Cloud.
+    Enables points to communicate across large occluded voids and capture shape symmetry.
+    """
+    def __init__(self, dim=256, num_heads=4):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # 3D Coordinate Positional Embedding
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, dim // 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(dim // 2, dim),
+        )
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+
+    def forward(self, x, coords):
+        # x: (B, N, dim)
+        # coords: (B, N, 3)
+        B, N, D = x.shape
+
+        # Positional embedding from 3D coordinates
+        pos = self.pos_mlp(coords)
+        h = x + pos
+
+        # Self-Attention (Pre-Norm)
+        norm_h = self.norm1(h)
+        qkv = self.qkv(norm_h).reshape(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, D)
+        x = x + self.proj(attn_out)
+
+        # FFN (Pre-Norm)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 class OptimizedEdgeConv(nn.Module):
     """
     Local Geometric Graph Convolution (EdgeConv).
@@ -48,12 +100,12 @@ class OptimizedEdgeConv(nn.Module):
 
 class HierarchicalPointEncoder(nn.Module):
     """
-    Zonal Hierarchical Point Cloud Encoder.
+    Zonal Hierarchical Point Cloud Encoder with Global Self-Attention.
     Processes input partial scans (B, N, 3) across 3 tiers:
-      1. Point-Level Multi-Scale Convs:
+      1. Point-Level Multi-Scale Convs & Global Self-Attention:
          - Level 1: Curvature & Crease-Aware EdgeConv (Local relative displacements, 64-dim)
          - Level 2: Regional features (128-dim)
-         - Level 3: Global macro features (256-dim)
+         - Level 3: Global macro features (256-dim) + Global Point Self-Attention (FlashAttention)
       2. Top Tier: Global Macro Context (B, out_dim) via multi-scale pooling
       3. Middle Tier: K Zonal Encoders (B, K, out_dim) via spatial distance-biased cross-attention
          anchored around learnable 3D zone centers
@@ -86,6 +138,9 @@ class HierarchicalPointEncoder(nn.Module):
             nn.BatchNorm1d(256),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
         )
+
+        # Global Multi-Head Self-Attention over 3D Point Cloud (256-dim)
+        self.global_attn = GlobalPointTransformerBlock(dim=256, num_heads=4)
 
         # Multi-scale global hierarchical fusion: (64 + 128 + 256 = 448 -> out_dim)
         feat_dim = 64 + 128 + 256
@@ -146,19 +201,22 @@ class HierarchicalPointEncoder(nn.Module):
         x_trans = x.transpose(1, 2)
 
         # Hierarchical forward representations
-        f1 = self.level1(x_trans)  # (B, 64, N)
-        f2 = self.level2(f1)       # (B, 128, N)
-        f3 = self.level3(f2)       # (B, 512, N)
+        f1 = self.level1(x_trans)                          # (B, 64, N)
+        f2 = self.level2(f1)                               # (B, 128, N)
+        f3_local = self.level3(f2)                         # (B, 256, N)
+
+        # Global Multi-Head Self-Attention across all points with 3D coordinate positional encoding
+        f3 = self.global_attn(f3_local.transpose(1, 2), coords=x).transpose(1, 2)  # (B, 256, N)
 
         # 1. Global Macro Context (Top Tier)
         p1 = torch.max(f1, dim=2)[0]  # (B, 64)
         p2 = torch.max(f2, dim=2)[0]  # (B, 128)
-        p3 = torch.max(f3, dim=2)[0]  # (B, 512)
-        global_feat = torch.cat([p1, p2, p3], dim=-1)         # (B, 704)
+        p3 = torch.max(f3, dim=2)[0]  # (B, 256)
+        global_feat = torch.cat([p1, p2, p3], dim=-1)         # (B, 448)
         global_embedding = self.global_fusion(global_feat)    # (B, out_dim)
 
         # 2. Zonal Spatial Cross-Attention (Middle Tier)
-        point_feats = torch.cat([f1, f2, f3], dim=1).transpose(1, 2)  # (B, N, 704)
+        point_feats = torch.cat([f1, f2, f3], dim=1).transpose(1, 2)  # (B, N, 448)
 
         # Condition zone queries on global context
         K = self.num_patches
@@ -206,6 +264,7 @@ if __name__ == "__main__":
 
     print(f"Input points grad norm   : {dummy_pc.grad.norm().item():.4f}")
     print(f"Level 1 EdgeConv mlp norm: {encoder.level1.mlp[0].weight.grad.norm().item():.4f}")
-    print(f"Level 3 conv2 grad norm  : {encoder.level3[3].weight.grad.norm().item():.4f}")
+    print(f"Global Attn proj grad norm: {encoder.global_attn.proj.weight.grad.norm().item():.4f}")
+    print(f"Global Attn pos grad norm: {encoder.global_attn.pos_mlp[0].weight.grad.norm().item():.4f}")
     assert dummy_pc.grad is not None and dummy_pc.grad.norm().item() > 0, "No gradients reached input points!"
     print("\nEncoder test: PASSED (healthy multi-scale gradients).")
